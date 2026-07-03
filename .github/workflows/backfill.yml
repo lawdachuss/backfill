@@ -1,0 +1,52 @@
+name: Backfill
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  backfill:
+    runs-on: windows-latest
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      COOKIES: ${{ secrets.COOKIES }}
+      USER_AGENT: ${{ secrets.USER_AGENT }}
+      STREAMTAPE_LOGIN: ${{ secrets.STREAMTAPE_LOGIN }}
+      STREAMTAPE_API_KEY: ${{ secrets.STREAMTAPE_API_KEY }}
+      VOESX_API_KEY: ${{ secrets.VOESX_API_KEY }}
+      SENDCM_API_KEY: ${{ secrets.SENDCM_API_KEY }}
+      BYSE_API_KEY: ${{ secrets.BYSE_API_KEY }}
+      MIXDROP_EMAIL: ${{ secrets.MIXDROP_EMAIL }}
+      MIXDROP_KEY: ${{ secrets.MIXDROP_KEY }}
+      LOBFILE_API_KEY: ${{ secrets.LOBFILE_API_KEY }}
+      IMGBB_API_KEY: ${{ secrets.IMGBB_API_KEY }}
+      PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+      CATBOX_USERHASH: ${{ secrets.CATBOX_USERHASH }}
+      SEEKSTREAMING_KEY: ${{ secrets.SEEKSTREAMING_KEY }}
+      DATABASE_PASSWORD: ${{ secrets.DATABASE_PASSWORD }}
+      SESSION_DURATION: ${{ secrets.SESSION_DURATION }}
+      GITHUB_REPO: lawdachuss/backfill
+      GITHUB_BRANCH: master
+      GITHUB_PREVIEW_PATH: previews
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install FFmpeg
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Run backfill (5h max, 3min delay between recordings)
+        run: go run scripts/backfill_media.go -duration 5h -delay 3m -trigger-workflow
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

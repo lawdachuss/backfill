@@ -855,7 +855,10 @@ func main() {
 
 	// ── Trigger Next Run ─────────────────────────────────────────────────────────
 	if durationExceeded && *flagTrigger {
-		githubToken := os.Getenv("GITHUB_ACCESS_TOKEN")
+		githubToken := os.Getenv("GITHUB_TOKEN")
+		if githubToken == "" {
+			githubToken = os.Getenv("GH_TOKEN")
+		}
 		githubRepo := os.Getenv("GITHUB_REPOSITORY") // e.g. owner/repo
 		if githubToken != "" && githubRepo != "" {
 			err := triggerWorkflowDispatch(githubRepo, githubToken)
@@ -863,7 +866,7 @@ func main() {
 				errorf("Failed to trigger workflow dispatch: %v", err)
 			}
 		} else {
-			errorf("GITHUB_ACCESS_TOKEN or GITHUB_REPOSITORY not set, cannot trigger next workflow")
+			errorf("GITHUB_TOKEN/GH_TOKEN or GITHUB_REPOSITORY not set, cannot trigger next workflow")
 		}
 	}
 
