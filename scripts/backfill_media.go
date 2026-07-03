@@ -143,10 +143,11 @@ func extractStreamtapeID(stURL string) string {
 
 // getStreamtapeDirectURL obtains the CDN direct URL for a Streamtape video
 // without downloading any content. It performs the ticket + dl API steps.
-func getStreamtapeDirectURL(stEmbedURL, stLogin, stKey string) (string, error) {
+// Returns the CDN URL and the file size in bytes (0 if unavailable).
+func getStreamtapeDirectURL(stEmbedURL, stLogin, stKey string) (string, int64, error) {
 	videoID := extractStreamtapeID(stEmbedURL)
 	if videoID == "" {
-		return "", fmt.Errorf("cannot extract video ID from: %s", stEmbedURL)
+		return "", 0, fmt.Errorf("cannot extract video ID from: %s", stEmbedURL)
 	}
 
 	var ticket string
@@ -158,7 +159,7 @@ func getStreamtapeDirectURL(stEmbedURL, stLogin, stKey string) (string, error) {
 	for attempt := 1; attempt <= 5; attempt++ {
 		ticketData, err := httpGetJSON(ticketURL)
 		if err != nil {
-			return "", fmt.Errorf("streamtape ticket request: %w", err)
+			return "", 0, fmt.Errorf("streamtape ticket request: %w", err)
 		}
 		statusVal, _ := ticketData["status"].(float64)
 		msg, _ := ticketData["msg"].(string)
@@ -168,7 +169,7 @@ func getStreamtapeDirectURL(stEmbedURL, stLogin, stKey string) (string, error) {
 			continue
 		}
 		if result, _ := ticketData["result"].(string); result != "" && strings.Contains(result, "Error") {
-			return "", fmt.Errorf("streamtape ticket error: %s", result)
+			return "", 0, fmt.Errorf("streamtape ticket error: %s", result)
 		}
 		resultData, _ = ticketData["result"].(map[string]interface{})
 		ticket, _ = resultData["ticket"].(string)
@@ -178,7 +179,7 @@ func getStreamtapeDirectURL(stEmbedURL, stLogin, stKey string) (string, error) {
 		time.Sleep(2 * time.Second)
 	}
 	if ticket == "" {
-		return "", fmt.Errorf("no ticket from Streamtape after retries")
+		return "", 0, fmt.Errorf("no ticket from Streamtape after retries")
 	}
 	if wait, ok := resultData["wait"].(float64); ok && wait > 0 {
 		logf("  streamtape: waiting %.0fs before dl URL…", wait)
@@ -189,23 +190,27 @@ func getStreamtapeDirectURL(stEmbedURL, stLogin, stKey string) (string, error) {
 	for attempt := 1; attempt <= 6; attempt++ {
 		dlData, err := httpGetJSON(dlInfoURL)
 		if err != nil {
-			return "", fmt.Errorf("streamtape dl info: %w", err)
+			return "", 0, fmt.Errorf("streamtape dl info: %w", err)
 		}
 		statusVal, _ := dlData["status"].(float64)
 		msg, _ := dlData["msg"].(string)
 		dlResult, _ := dlData["result"].(map[string]interface{})
 		directURL, _ := dlResult["url"].(string)
 		if directURL != "" {
-			return directURL, nil
+			var fileSize int64
+			if sizeVal, ok := dlResult["size"].(float64); ok {
+				fileSize = int64(sizeVal)
+			}
+			return directURL, fileSize, nil
 		}
 		if statusVal == 403 || statusVal == 429 || strings.Contains(msg, "wait") {
 			logf("  streamtape: dl URL rate-limited (%s), waiting 4s (attempt %d/6)…", msg, attempt)
 			time.Sleep(4 * time.Second)
 			continue
 		}
-		return "", fmt.Errorf("no direct URL from Streamtape: %v", dlData)
+		return "", 0, fmt.Errorf("no direct URL from Streamtape: %v", dlData)
 	}
-	return "", fmt.Errorf("failed to get direct URL from Streamtape after retries")
+	return "", 0, fmt.Errorf("failed to get direct URL from Streamtape after retries")
 }
 
 // ─── URL-based media generation ──────────────────────────────────────────────────────────────────
@@ -249,25 +254,48 @@ func ffmpegRun(ctx context.Context, args ...string) error {
 }
 
 // ffprobeURLDuration probes the duration of a remote video URL using ffprobe.
+// Uses extended analyze duration and probesize for large files with trailing moov atoms.
+// On failure, returns 0 — caller should fall back to size-based estimation.
 func ffprobeURLDuration(videoURL string) float64 {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, ffprobeBin(),
 		"-v", "error",
+		"-analyzeduration", "200M",
+		"-probesize", "200M",
 		"-show_entries", "format=duration",
 		"-of", "default=noprint_wrappers=1:nokey=1",
+		"-timeout", "120000000",
 		videoURL,
 	).Output()
 	if err != nil {
+		errorf("  ffprobe duration failed: %v", err)
+		if out != nil && len(out) > 0 {
+			errorf("  ffprobe stderr: %s", string(out))
+		}
 		return 0
 	}
-	dur, _ := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	dur, parseErr := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if parseErr != nil || dur <= 0 {
+		errorf("  ffprobe duration parse failed: %v (raw: %q)", parseErr, strings.TrimSpace(string(out)))
+		return 0
+	}
 	return dur
+}
+
+// estimateDurationFromSize estimates video duration from file size.
+// Uses 3 Mbps average bitrate (720p H.264) for estimation.
+func estimateDurationFromSize(fileSizeBytes int64) float64 {
+	if fileSizeBytes <= 0 {
+		return 0
+	}
+	avgBitrate := 3.0 * 1024 * 1024 / 8 // 3 Mbps in bytes/sec = 393216
+	return float64(fileSizeBytes) / avgBitrate
 }
 
 // generateMediaFromURL generates thumbnail, sprite, and preview for a video
 // reachable at cdnURL using FFmpeg HTTP range requests. No full download.
-func generateMediaFromURL(cdnURL, filename string, needThumb, needSprite, needPreview bool) (thumbURL, spriteURL, previewURL string) {
+func generateMediaFromURL(cdnURL, filename string, fileSize int64, needThumb, needSprite, needPreview bool) (thumbURL, spriteURL, previewURL string) {
 	tmpDir, err := os.MkdirTemp("", "backfill-url-*")
 	if err != nil {
 		errorf("  temp dir: %v", err)
@@ -278,10 +306,16 @@ func generateMediaFromURL(cdnURL, filename string, needThumb, needSprite, needPr
 	logf("  🔍 probing duration via ffprobe…")
 	dur := ffprobeURLDuration(cdnURL)
 	if dur <= 0 {
-		errorf("  could not probe duration from URL")
-		return
+		logf("  ffprobe failed, estimating duration from file size…")
+		dur = estimateDurationFromSize(fileSize)
+		if dur <= 0 {
+			errorf("  could not determine duration (ffprobe failed, size %d bytes)", fileSize)
+			return
+		}
+		logf("  ✓ estimated duration: %.1fs (%.1f min) from %d bytes at ~3 Mbps", dur, dur/60, fileSize)
+	} else {
+		logf("  ✓ duration: %.1fs (%.1f min)", dur, dur/60)
 	}
-	logf("  ✓ duration: %.1fs (%.1f min)", dur, dur/60)
 
 	type result struct{ url string }
 	thumbCh := make(chan result, 1)
@@ -645,7 +679,7 @@ func processOne(item workItem, seekKey, stLogin, stKey string, dryRun, thumbOnly
 		}
 
 		logf("  🔗 getting Streamtape CDN URL (no download)…")
-		cdnURL, err := getStreamtapeDirectURL(stURL, stLogin, stKey)
+		cdnURL, fileSize, err := getStreamtapeDirectURL(stURL, stLogin, stKey)
 		if err != nil {
 			errorf("  CDN URL failed: %v", err)
 			atomic.AddInt64(&cntFailed, 1)
@@ -654,10 +688,14 @@ func processOne(item workItem, seekKey, stLogin, stKey string, dryRun, thumbOnly
 			}
 			return true // tried Streamtape, count as tried
 		}
-		logf("  ✓ CDN URL acquired — generating via FFmpeg HTTP range requests…")
+		if fileSize > 0 {
+			logf("  ✓ CDN URL acquired (size: %.1f MB) — generating via FFmpeg HTTP range requests…", float64(fileSize)/1024/1024)
+		} else {
+			logf("  ✓ CDN URL acquired — generating via FFmpeg HTTP range requests…")
+		}
 		atomic.AddInt64(&cntDownloaded, 1) // count as "processed"
 
-		genThumb, genSprite, genPreview := generateMediaFromURL(cdnURL, rec.Filename, needThumb, needSprite, needPreview)
+		genThumb, genSprite, genPreview := generateMediaFromURL(cdnURL, rec.Filename, fileSize, needThumb, needSprite, needPreview)
 
 		if needThumb && genThumb != "" {
 			thumb = genThumb
