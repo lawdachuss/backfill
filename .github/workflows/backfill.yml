@@ -47,8 +47,8 @@ jobs:
       - name: Install FFmpeg
         run: choco install ffmpeg -y --no-progress
 
-      - name: Run backfill (5h max, 3min delay between recordings)
-        run: go run scripts/backfill_media.go -duration 5h -delay 3m -trigger-workflow
+      - name: Run backfill (5h max, 2min delay between recordings)
+        run: go run scripts/backfill_media.go -duration 5h -delay 2m -concurrency 1 -trigger-workflow
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FFMPEG_PATH: ffmpeg
