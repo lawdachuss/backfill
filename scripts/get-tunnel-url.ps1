@@ -1,0 +1,64 @@
+# Get the current tunnel URL from Supabase
+# Usage: .\scripts\get-tunnel-url.ps1
+
+$ErrorActionPreference = "Stop"
+
+# Load environment variables from .env if it exists
+if (Test-Path ".env") {
+    Get-Content ".env" | ForEach-Object {
+        if ($_ -match '^\s*([^#][^=]+)=(.*)$') {
+            $name = $matches[1].Trim()
+            $value = $matches[2].Trim()
+            [Environment]::SetEnvironmentVariable($name, $value, "Process")
+        }
+    }
+}
+
+$SUPABASE_URL = $env:SUPABASE_URL
+$SUPABASE_API_KEY = $env:SUPABASE_API_KEY
+
+if (-not $SUPABASE_URL -or -not $SUPABASE_API_KEY) {
+    Write-Host "❌ Error: SUPABASE_URL and SUPABASE_API_KEY must be set" -ForegroundColor Red
+    Write-Host "Set them in .env file or as environment variables" -ForegroundColor Yellow
+    exit 1
+}
+
+Write-Host "🔍 Fetching latest tunnel URL from Supabase..." -ForegroundColor Cyan
+
+try {
+    $response = Invoke-RestMethod -Uri "$SUPABASE_URL/rest/v1/tunnel_sessions?select=*&order=started_at.desc&limit=1" `
+        -Method Get `
+        -Headers @{
+            "apikey" = $SUPABASE_API_KEY
+            "Content-Type" = "application/json"
+        }
+
+    if ($response -and $response.Count -gt 0) {
+        $tunnel = $response[0]
+        Write-Host ""
+        Write-Host "╔════════════════════════════════════════════════════════════╗" -ForegroundColor Green
+        Write-Host "║                    🌐 WEB UI ACCESS                        ║" -ForegroundColor Green
+        Write-Host "╚════════════════════════════════════════════════════════════╝" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "   $($tunnel.url)" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "   Run ID: $($tunnel.run_id)" -ForegroundColor Gray
+        Write-Host "   Started: $($tunnel.started_at)" -ForegroundColor Gray
+        Write-Host ""
+        
+        # Copy to clipboard if possible
+        try {
+            Set-Clipboard -Value $tunnel.url
+            Write-Host "✅ URL copied to clipboard!" -ForegroundColor Green
+        } catch {
+            Write-Host "ℹ️  Copy the URL above to access the UI" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "❌ No tunnel sessions found in Supabase" -ForegroundColor Red
+        Write-Host "Make sure the GitHub Actions workflow has run at least once" -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "❌ Error fetching tunnel URL: $_" -ForegroundColor Red
+    Write-Host "Check your Supabase credentials and ensure the tunnel_sessions table exists" -ForegroundColor Yellow
+    exit 1
+}
