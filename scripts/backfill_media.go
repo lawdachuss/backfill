@@ -531,10 +531,19 @@ func urlGenPreview(cdnURL string, dur float64, tmpDir, filename string) (string,
 	if err != nil {
 		catboxErr := err
 		logf("  catbox failed (%s): %v", previewSize, catboxErr)
-		lobfile := uploader.NewLobFileUploader(os.Getenv("LOBFILE_API_KEY"))
-		remoteURL, err = lobfile.Upload(previewPath)
+
+		x02 := uploader.NewX02Uploader(os.Getenv("X02_API_KEY"))
+		remoteURL, err = x02.Upload(previewPath)
 		if err != nil {
-			return "", fmt.Errorf("upload preview (%s, catbox+lobfile both failed): catbox: %v; lobfile: %w", previewSize, catboxErr, err)
+			x02Err := err
+			logf("  x02.me failed (%s): %v", previewSize, x02Err)
+
+			supa := uploader.NewSupabaseStorageUploader()
+			_ = supa.EnsureBucket()
+			remoteURL, err = supa.Upload(previewPath)
+			if err != nil {
+				return "", fmt.Errorf("upload preview (%s, catbox+x02+supabase all failed): catbox: %v; x02: %v; supabase: %w", previewSize, catboxErr, x02Err, err)
+			}
 		}
 	}
 	logf("  ✓ preview: %s", remoteURL)

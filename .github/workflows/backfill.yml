@@ -29,6 +29,7 @@ jobs:
       IMGBB_API_KEY: ${{ secrets.IMGBB_API_KEY }}
       PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
       CATBOX_USERHASH: ${{ secrets.CATBOX_USERHASH }}
+      X02_API_KEY: ${{ secrets.X02_API_KEY }}
       SEEKSTREAMING_KEY: ${{ secrets.SEEKSTREAMING_KEY }}
       DATABASE_PASSWORD: ${{ secrets.DATABASE_PASSWORD }}
       SESSION_DURATION: ${{ secrets.SESSION_DURATION }}
