@@ -50,3 +50,4 @@ jobs:
         run: go run scripts/backfill_media.go -duration 5h -delay 3m -trigger-workflow
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FFMPEG_PATH: ""
