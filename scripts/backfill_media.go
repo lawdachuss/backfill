@@ -948,6 +948,40 @@ func main() {
 		wg.Wait()
 	}
 
+	// ── Retry pass: re-check recordings that may have gotten Streamtape links ────
+	// while the backfill was running (uploader may have added them during processing).
+	logf("Re-checking for recordings that now have Streamtape links…")
+	recordings2, err := client.GetAllRecordings()
+	if err == nil {
+		var retry []database.Recording
+		for _, r := range recordings2 {
+			if r.ThumbnailURL == "" || r.SpriteURL == "" || r.PreviewURL == "" {
+				retry = append(retry, r)
+			}
+		}
+		if len(retry) > 0 {
+			logf("Retry pass: %d recordings still need media — re-fetching upload links…", len(retry))
+			allLinks2, err := client.GetAllUploadLinks()
+			if err == nil {
+				linksByID2 := make(map[string]map[string]string, len(recordings2))
+				for _, l := range allLinks2 {
+					m := linksByID2[l.RecordingID]
+					if m == nil {
+						m = make(map[string]string)
+						linksByID2[l.RecordingID] = m
+					}
+					m[l.Host] = l.URL
+				}
+				for _, r := range retry {
+					item := workItem{rec: r, links: linksByID2[r.ID]}
+					processOne(item, seekKey, stLogin, stKey, *flagDryRun, *flagThumbOnly)
+				}
+			}
+		} else {
+			logf("Retry pass: all recordings now have complete media.")
+		}
+	}
+
 	// ── Trigger Next Run ─────────────────────────────────────────────────────────
 	if durationExceeded && *flagTrigger {
 		githubToken := os.Getenv("GITHUB_TOKEN")
