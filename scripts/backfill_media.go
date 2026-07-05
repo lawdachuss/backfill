@@ -257,30 +257,39 @@ func ffmpegRun(ctx context.Context, args ...string) error {
 // Uses extended analyze duration and probesize for large files with trailing moov atoms.
 // On failure, returns 0 — caller should fall back to size-based estimation.
 func ffprobeURLDuration(videoURL string) float64 {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, ffprobeBin(),
-		"-v", "error",
-		"-analyzeduration", "200M",
-		"-probesize", "200M",
-		"-show_entries", "format=duration",
-		"-of", "default=noprint_wrappers=1:nokey=1",
-		"-timeout", "120000000",
-		videoURL,
-	).Output()
-	if err != nil {
-		errorf("  ffprobe duration failed: %v", err)
-		if out != nil && len(out) > 0 {
-			errorf("  ffprobe stderr: %s", string(out))
+	for attempt := 0; attempt < 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		out, err := exec.CommandContext(ctx, ffprobeBin(),
+			"-v", "error",
+			"-analyzeduration", "200M",
+			"-probesize", "200M",
+			"-show_entries", "format=duration",
+			"-of", "default=noprint_wrappers=1:nokey=1",
+			"-timeout", "120000000",
+			videoURL,
+		).Output()
+		cancel()
+		if err != nil {
+			if attempt < 2 {
+				backoff := time.Duration(2<<uint(attempt)) * time.Second
+				errorf("  ffprobe duration failed (attempt %d/3), retrying in %v: %v", attempt+1, backoff, err)
+				time.Sleep(backoff)
+				continue
+			}
+			errorf("  ffprobe duration failed: %v", err)
+			if out != nil && len(out) > 0 {
+				errorf("  ffprobe stderr: %s", string(out))
+			}
+			return 0
 		}
-		return 0
+		dur, parseErr := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+		if parseErr != nil || dur <= 0 {
+			errorf("  ffprobe duration parse failed: %v (raw: %q)", parseErr, strings.TrimSpace(string(out)))
+			return 0
+		}
+		return dur
 	}
-	dur, parseErr := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
-	if parseErr != nil || dur <= 0 {
-		errorf("  ffprobe duration parse failed: %v (raw: %q)", parseErr, strings.TrimSpace(string(out)))
-		return 0
-	}
-	return dur
+	return 0
 }
 
 // estimateDurationFromSize estimates video duration from file size.
@@ -511,30 +520,59 @@ func urlGenPreview(cdnURL string, dur float64, tmpDir, filename string) (string,
 		}
 
 		clipPath := filepath.Join(tmpDir, fmt.Sprintf("clip_%02d.mp4", i))
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-		err := ffmpegRun(ctx,
-			"-y",
-			"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
-			"-ss", fmt.Sprintf("%.3f", startPos),
-			"-i", cdnURL,
-			"-t", fmt.Sprintf("%.3f", segDur),
-			"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos", urlPreviewW),
-			"-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-			"-pix_fmt", "yuv420p", "-an",
-			clipPath,
-		)
-		cancel()
-		if err != nil {
-			return "", fmt.Errorf("preview clip %d: %w", i, err)
+		var clipErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			clipErr = ffmpegRun(ctx,
+				"-y",
+				"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
+				"-ss", fmt.Sprintf("%.3f", startPos),
+				"-i", cdnURL,
+				"-t", fmt.Sprintf("%.3f", segDur),
+				"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos", urlPreviewW),
+				"-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+				"-pix_fmt", "yuv420p", "-an",
+				clipPath,
+			)
+			cancel()
+			if clipErr == nil {
+				break
+			}
+			if attempt < 2 {
+				backoff := time.Duration(2<<uint(attempt)) * time.Second
+				logf("  preview clip %d failed (attempt %d/3), retrying in %v: %v", i, attempt+1, backoff, clipErr)
+				time.Sleep(backoff)
+			}
+		}
+		if clipErr != nil {
+			return "", fmt.Errorf("preview clip %d after 3 attempts: %w", i, clipErr)
 		}
 		clipPaths = append(clipPaths, clipPath)
 		logf("  preview clip %d/%d done", i+1, urlPreviewSegs)
 	}
 
+	// Filter out empty/invalid clips
+	var validClips []string
+	for _, p := range clipPaths {
+		fi, err := os.Stat(p)
+		if err != nil {
+			logf("  skipping unreadable clip %s: %v", p, err)
+			continue
+		}
+		if fi.Size() > 500 {
+			validClips = append(validClips, p)
+		} else {
+			logf("  skipping empty clip %s (size %d bytes)", p, fi.Size())
+		}
+	}
+	if len(validClips) == 0 {
+		return "", fmt.Errorf("all %d preview clips are empty", len(clipPaths))
+	}
+
 	// Write concat list
 	concatListPath := filepath.Join(tmpDir, "concat_list.txt")
 	var concatLines []string
-	for _, p := range clipPaths {
+	for _, p := range validClips {
 		concatLines = append(concatLines, fmt.Sprintf("file '%s'", p))
 	}
 	if err := os.WriteFile(concatListPath, []byte(strings.Join(concatLines, "\n")), 0644); err != nil {
@@ -551,7 +589,17 @@ func urlGenPreview(cdnURL string, dur float64, tmpDir, filename string) (string,
 		"-movflags", "+faststart",
 		previewPath,
 	); err != nil {
-		return "", fmt.Errorf("concat: %w", err)
+		logf("  concat with stream copy failed, retrying with re-encode: %v", err)
+		if err2 := ffmpegRun(ctx,
+			"-y",
+			"-f", "concat", "-safe", "0", "-i", concatListPath,
+			"-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+			"-pix_fmt", "yuv420p",
+			"-movflags", "+faststart",
+			previewPath,
+		); err2 != nil {
+			return "", fmt.Errorf("concat (copy+reencode failed): %w / %v", err, err2)
+		}
 	}
 
 	fi, _ := os.Stat(previewPath)
