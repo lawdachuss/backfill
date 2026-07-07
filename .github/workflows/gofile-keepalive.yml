@@ -1,8 +1,6 @@
 name: GoFile Keep Alive
 
 on:
-  schedule:
-    - cron: '0 0 */6 * *'
   workflow_dispatch:
 
 permissions:
@@ -17,41 +15,17 @@ env:
   PYTHONUNBUFFERED: 1
 
 jobs:
-  distribute:
-    runs-on: ubuntu-latest
-    outputs:
-      batches: ${{ steps.list.outputs.batches }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Fetch and split GoFile codes
-        id: list
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
-          GOFILE_PROXY_URL: ${{ secrets.GOFILE_PROXY_URL }}
-        run: |
-          python gofile-keepalive/keepalive.py --list > batches.json
-          echo "batches=$(cat batches.json)" >> $GITHUB_OUTPUT
-
   keepalive:
-    needs: distribute
-    if: ${{ needs.distribute.outputs.batches != '[]' && needs.distribute.outputs.batches != '' }}
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        batch: ${{ fromJson(needs.distribute.outputs.batches) }}
-      fail-fast: false
     steps:
       - uses: actions/checkout@v4
 
-      - name: Process batch
+      - name: Fetch codes and process all batches sequentially
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
           GOFILE_PROXY_URL: ${{ secrets.GOFILE_PROXY_URL }}
-          BATCH_CODES: ${{ toJSON(matrix.batch) }}
-        run: python gofile-keepalive/keepalive.py --batch-env
+        run: python gofile-keepalive/keepalive.py
 
   retrigger:
     needs: keepalive
