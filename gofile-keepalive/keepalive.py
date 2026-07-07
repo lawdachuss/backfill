@@ -9,9 +9,10 @@ import re
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_API_KEY = os.environ.get("SUPABASE_API_KEY", "")
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-MAX_WORKERS = 15
+MAX_WORKERS = 3
 PAGE_SIZE = 1000
 BATCH_SIZE = 500
+REQUEST_DELAY = 0.3
 
 
 def log(msg: str):
@@ -56,20 +57,27 @@ def keep_alive(code: str) -> dict:
     req = urllib.request.Request(visit_url)
     req.add_header("User-Agent", USER_AGENT)
     start = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            resp.read()
-        elapsed = time.time() - start
-        return {"code": code, "status": "ok", "ms": round(elapsed * 1000), "http": resp.status}
-    except urllib.error.HTTPError as e:
-        elapsed = time.time() - start
-        return {"code": code, "status": "error", "error": f"HTTP {e.code}", "ms": round(elapsed * 1000)}
-    except urllib.error.URLError as e:
-        elapsed = time.time() - start
-        return {"code": code, "status": "error", "error": f"URL {e.reason}", "ms": round(elapsed * 1000)}
-    except Exception as e:
-        elapsed = time.time() - start
-        return {"code": code, "status": "error", "error": str(e)[:60], "ms": round(elapsed * 1000)}
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                resp.read()
+            elapsed = time.time() - start
+            return {"code": code, "status": "ok", "ms": round(elapsed * 1000), "http": resp.status}
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                wait = (attempt + 1) * 5
+                log(f"[gofile-keepalive]     429 on {code}, retry {attempt+1}/4 in {wait}s...")
+                time.sleep(wait)
+                continue
+            elapsed = time.time() - start
+            return {"code": code, "status": "error", "error": f"HTTP {e.code}", "ms": round(elapsed * 1000)}
+        except urllib.error.URLError as e:
+            elapsed = time.time() - start
+            return {"code": code, "status": "error", "error": f"URL {e.reason}", "ms": round(elapsed * 1000)}
+        except Exception as e:
+            elapsed = time.time() - start
+            return {"code": code, "status": "error", "error": str(e)[:60], "ms": round(elapsed * 1000)}
+    return {"code": code, "status": "error", "error": "429 exceeded retries", "ms": round((time.time() - start) * 1000)}
 
 
 def process_batch(batch_num: int, codes: list[str]) -> dict:
@@ -77,12 +85,17 @@ def process_batch(batch_num: int, codes: list[str]) -> dict:
     ok = 0
     errors = []
 
-    log(f"[gofile-keepalive]   Starting batch {batch_num} ({total} codes, {MAX_WORKERS} workers)...")
+    log(f"[gofile-keepalive]   Starting batch {batch_num} ({total} codes, {MAX_WORKERS} workers, {REQUEST_DELAY}s spacing)...")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        fut_map = {ex.submit(keep_alive, c): c for c in codes}
+        futs = []
+        for i, c in enumerate(codes):
+            futs.append(ex.submit(keep_alive, c))
+            if i < len(codes) - 1:
+                time.sleep(REQUEST_DELAY)
+
         done = 0
-        for fut in concurrent.futures.as_completed(fut_map):
+        for fut in concurrent.futures.as_completed(futs):
             r = fut.result()
             done += 1
             if r["status"] == "ok":
@@ -166,6 +179,23 @@ if __name__ == "__main__":
             cmd_run(codes)
         else:
             log("--batch requires a JSON array argument")
+            sys.exit(1)
+    elif "--batch-file" in sys.argv:
+        idx = sys.argv.index("--batch-file")
+        if idx + 1 < len(sys.argv):
+            with open(sys.argv[idx + 1]) as f:
+                codes = json.load(f)
+            cmd_run(codes)
+        else:
+            log("--batch-file requires a file path argument")
+            sys.exit(1)
+    elif "--batch-env" in sys.argv:
+        raw = os.environ.get("BATCH_CODES", "")
+        if raw:
+            codes = json.loads(raw)
+            cmd_run(codes)
+        else:
+            log("BATCH_CODES env var is empty or not set")
             sys.exit(1)
     else:
         cmd_run()
