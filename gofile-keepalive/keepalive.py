@@ -88,12 +88,17 @@ def try_opener(url: str, proxy: str = None, timeout: int = 15):
     start = time.time()
     try:
         with opener.open(req, timeout=timeout) as resp:
-            resp.read()
-        return resp.status, time.time() - start, None
+            body = resp.read().decode().strip()
+        return resp.status, time.time() - start, None, body
     except urllib.error.HTTPError as e:
-        return e.code, time.time() - start, None
+        body = ""
+        try:
+            body = e.read().decode().strip()[:100]
+        except:
+            pass
+        return e.code, time.time() - start, None, body
     except Exception as e:
-        return 0, time.time() - start, str(e)[:60]
+        return 0, time.time() - start, str(e)[:60], ""
 
 
 def process_codes_sequential(codes: list[str], proxies: list[str]) -> dict:
@@ -122,11 +127,12 @@ def process_codes_sequential(codes: list[str], proxies: list[str]) -> dict:
 
             via = "cloudflare" if GOFILE_PROXY_URL else ("direct" if not proxy else proxy)
             log(f"[gofile-keepalive]   req {i+1}/{total}: {code} via {via} (attempt {attempt+1})")
-            status, elapsed, err_str = try_opener(url, proxy)
+            status, elapsed, err_str, resp_body = try_opener(url, proxy)
 
             if status == 200 or status == 206:
                 ok += 1
-                log(f"[gofile-keepalive]     ok ({elapsed*1000:.0f}ms)")
+                via_label = "cloudflare" if GOFILE_PROXY_URL else ("direct" if not proxy else proxy)
+                log(f"[gofile-keepalive]     ok via {via_label} ({elapsed*1000:.0f}ms) resp={resp_body}")
                 result = "ok"
                 break
             elif status == 429:
@@ -144,8 +150,8 @@ def process_codes_sequential(codes: list[str], proxies: list[str]) -> dict:
                     result = "error"
                     break
             else:
-                log(f"[gofile-keepalive]     HTTP {status} ({elapsed*1000:.0f}ms)")
-                errors.append({"code": code, "error": f"HTTP {status}"})
+                log(f"[gofile-keepalive]     HTTP {status} ({elapsed*1000:.0f}ms) resp={resp_body}")
+                errors.append({"code": code, "error": f"HTTP {status} {resp_body}"})
                 result = "error"
                 break
 
