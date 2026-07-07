@@ -44,7 +44,7 @@ def extract_code(url: str) -> str:
     return m.group(1) if m else ""
 
 
-def visit_page(code: str, timeout: int = 15):
+def visit_page(code: str, timeout: int = 30):
     url = f"{GOFILE_PROXY_URL}?code={code}" if GOFILE_PROXY_URL else f"https://gofile.io/d/{code}"
     req = urllib.request.Request(url, headers={
         "User-Agent": UA,
