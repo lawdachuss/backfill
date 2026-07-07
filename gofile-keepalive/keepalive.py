@@ -12,7 +12,6 @@ SUPABASE_API_KEY = os.environ.get("SUPABASE_API_KEY", "")
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
 PAGE_SIZE = 1000
 BATCH_SIZE = 500
-MIN_DELAY = 1.0
 
 
 def log(msg: str):
@@ -35,8 +34,8 @@ def fetch_proxies() -> list[str]:
                     line = line.strip()
                     if line and ":" in line:
                         all_proxies.add(line)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"[gofile-keepalive] Proxy source failed: {url.split('/')[2]} — {e}")
     result = list(all_proxies)
     random.shuffle(result)
     return result
@@ -75,7 +74,7 @@ def extract_code(url: str) -> str:
     return m.group(1) if m else ""
 
 
-def try_opener(url: str, proxy: str = None, timeout: int = 15):
+def try_opener(url: str, proxy: str = None, timeout: int = 8):
     if proxy:
         handler = urllib.request.ProxyHandler({
             "http": f"http://{proxy}",
@@ -93,106 +92,66 @@ def try_opener(url: str, proxy: str = None, timeout: int = 15):
     except urllib.error.HTTPError as e:
         return e.code, time.time() - start, None
     except Exception as e:
-        return 0, time.time() - start, str(e)
+        return 0, time.time() - start, str(e)[:60]
 
 
-def process_batch(batch_num: int, codes: list[str], proxies: list[str]) -> dict:
+def process_codes_sequential(codes: list[str], proxies: list[str]) -> dict:
     total = len(codes)
     ok = 0
     errors = []
-    delay = MIN_DELAY
-    consecutive_ok = 0
+    delay = 1.0
     pi = 0
-    bad_proxies = set()
-    no_proxy_once = True
+    bad = set()
 
-    proxy_mode = len(proxies) > 0
-    if proxy_mode:
-        log(f"[gofile-keepalive]   Starting batch {batch_num} ({total} codes, {len(proxies)} proxies round-robin)")
-    else:
-        log(f"[gofile-keepalive]   Starting batch {batch_num} ({total} codes, direct connection)")
+    use_proxies = len(proxies) > 0
 
     for i, code in enumerate(codes):
         url = f"https://gofile.io/d/{code}"
+        result = None
 
-        if proxy_mode:
+        for attempt in range(3):
             proxy = None
-            for attempt in range(3):
-                for _ in range(50):
+            if use_proxies:
+                for _ in range(100):
                     p = proxies[pi % len(proxies)]
                     pi += 1
-                    if p not in bad_proxies:
+                    if p not in bad:
                         proxy = p
                         break
 
-                status, elapsed, err_str = try_opener(url, proxy)
+            log(f"[gofile-keepalive]   req {i+1}/{total}: {code} {'via ' + proxy if proxy else 'direct'} (attempt {attempt+1})")
+            status, elapsed, err_str = try_opener(url, proxy)
 
-                if status == 200 or status == 206:
-                    ok += 1
-                    consecutive_ok += 1
-                    if consecutive_ok >= 20 and delay > MIN_DELAY:
-                        delay = max(MIN_DELAY, delay - 0.3)
-                        consecutive_ok = 0
-                    break
-                elif status == 429:
-                    wait = (attempt + 1) * 6
-                    delay += 1.0
-                    consecutive_ok = 0
-                    log(f"[gofile-keepalive]     429 on {code} via {proxy}, retry {attempt+1}/3 in {wait}s (delay={delay:.1f}s)")
-                    time.sleep(wait)
-                elif status == 0:
-                    bad_proxies.add(proxy)
-                    if attempt < 2:
-                        continue
-                    errors.append({"code": code, "error": f"proxy {err_str or 'fail'}"})
-                    consecutive_ok = 0
-                    break
-                else:
-                    errors.append({"code": code, "error": f"HTTP {status}", "ms": round(elapsed * 1000)})
-                    consecutive_ok = 0
-                    break
-            else:
-                errors.append({"code": code, "error": "429 exceeded retries"})
-                consecutive_ok = 0
-        else:
-            status, elapsed, err_str = try_opener(url, None)
             if status == 200 or status == 206:
                 ok += 1
+                log(f"[gofile-keepalive]     ok ({elapsed*1000:.0f}ms)")
+                result = "ok"
+                break
             elif status == 429:
-                if no_proxy_once:
-                    log(f"[gofile-keepalive]     429 without proxy — trying proxies as fallback...")
-                    no_proxy_once = False
-                    if not proxies:
-                        log("[gofile-keepalive]     No proxies available, retrying directly...")
-                        time.sleep(10)
-                        status2, _, _ = try_opener(url, None, timeout=20)
-                        if status2 == 200 or status2 == 206:
-                            ok += 1
-                        else:
-                            errors.append({"code": code, "error": f"429 direct"})
-                    else:
-                        proxy_mode = True
-                        pi = 0
-                        continue
-                else:
-                    errors.append({"code": code, "error": "429 direct"})
+                wait = (attempt + 1) * 6
+                delay += 1.0
+                log(f"[gofile-keepalive]     429 — retry {attempt+1}/3 in {wait}s, delay now {delay:.1f}s")
+                time.sleep(wait)
             elif status == 0:
-                errors.append({"code": code, "error": f"conn {err_str}"})
+                if proxy:
+                    bad.add(proxy)
+                    log(f"[gofile-keepalive]     proxy dead: {proxy} ({err_str}) — trying next")
+                else:
+                    log(f"[gofile-keepalive]     conn fail: {err_str}")
+                    errors.append({"code": code, "error": f"conn {err_str}"})
+                    result = "error"
+                    break
             else:
-                errors.append({"code": code, "error": f"HTTP {status}", "ms": round(elapsed * 1000)})
+                log(f"[gofile-keepalive]     HTTP {status} ({elapsed*1000:.0f}ms)")
+                errors.append({"code": code, "error": f"HTTP {status}"})
+                result = "error"
+                break
 
-        if (i + 1) % 100 == 0 or i == total - 1:
-            speed = (i + 1) / (time.time() - global_batch_start + 0.001)
-            eta_s = (total - i - 1) / (speed + 0.001) if speed > 0 else 0
-            etas = f"{eta_s/60:.0f}m" if eta_s < 3600 else f"{eta_s/3600:.1f}h"
-            pd = "proxy" if proxy_mode else "direct"
-            log(f"[gofile-keepalive]     {i+1}/{total} — {ok} ok, {len(errors)} err — {speed:.2f}/s — ETA {etas} — {pd} — delay={delay:.1f}s")
+        if result is None:
+            errors.append({"code": code, "error": "429 exceeded retries"})
 
         time.sleep(delay)
 
-    if proxy_mode:
-        log(f"[gofile-keepalive]   Bad proxies discarded: {len(bad_proxies)}/{len(proxies)}")
-    log(f"[gofile-keepalive]   Batch {batch_num} done: {ok}/{total} ok, {len(errors)} errors")
     return {"total": total, "ok": ok, "errors": errors}
 
 
@@ -209,8 +168,6 @@ def cmd_list():
 
 
 def cmd_run(codes: list[str] = None):
-    global global_batch_start
-
     if codes:
         link_codes = codes
         log(f"[gofile-keepalive] Processing {len(link_codes)} codes")
@@ -228,32 +185,30 @@ def cmd_run(codes: list[str] = None):
     proxies = []
     if "--no-proxies" not in sys.argv:
         log("[gofile-keepalive] Fetching proxy list...")
-        raw = fetch_proxies()
-        proxies = raw
-        log(f"[gofile-keepalive] Loaded {len(proxies)} proxies (no pre-test, on-demand fallback)")
-    else:
-        log("[gofile-keepalive] Proxies disabled via --no-proxies")
+        proxies = fetch_proxies()
+        log(f"[gofile-keepalive] Loaded {len(proxies)} proxies (on-demand, no pre-test)")
 
     all_ok = 0
     all_errors = []
     batch_num = 1
-    global_batch_start = time.time()
+    start_time = time.time()
 
     total = len(link_codes)
     for i in range(0, total, BATCH_SIZE):
         batch = link_codes[i:i + BATCH_SIZE]
         log(f"[gofile-keepalive] Batch {batch_num}: {len(batch)} codes ({i+1}-{i+len(batch)} of {total})")
-        result = process_batch(batch_num, batch, proxies)
+        result = process_codes_sequential(batch, proxies)
         all_ok += result["ok"]
         all_errors.extend(result["errors"])
-        elapsed = time.time() - global_batch_start
+        elapsed = time.time() - start_time
         log(f"[gofile-keepalive] Overall: {all_ok}/{total} ok, {len(all_errors)} errors ({elapsed/60:.0f}m elapsed)")
         if i + BATCH_SIZE < total:
+            log(f"[gofile-keepalive] Waiting 3s before next batch...")
             time.sleep(3)
         batch_num += 1
 
     summary = {"total": total, "ok": all_ok, "errors": len(all_errors)}
-    elapsed = time.time() - global_batch_start
+    elapsed = time.time() - start_time
     log(f"[gofile-keepalive] Done in {elapsed/60:.0f}m: {json.dumps(summary)}")
     print(json.dumps(summary), flush=True)
 
@@ -266,8 +221,6 @@ def cmd_run(codes: list[str] = None):
         log("[gofile-keepalive] FATAL: zero successes, exiting with code 1")
         sys.exit(1)
 
-
-global_batch_start = 0.0
 
 if __name__ == "__main__":
     if "--list" in sys.argv:
