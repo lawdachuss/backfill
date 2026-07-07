@@ -7,6 +7,11 @@ on:
 
 permissions:
   contents: read
+  actions: write
+
+concurrency:
+  group: gofile-keepalive
+  cancel-in-progress: false
 
 env:
   PYTHONUNBUFFERED: 1
@@ -47,3 +52,13 @@ jobs:
           GOFILE_PROXY_URL: ${{ secrets.GOFILE_PROXY_URL }}
           BATCH_CODES: ${{ toJSON(matrix.batch) }}
         run: python gofile-keepalive/keepalive.py --batch-env
+
+  retrigger:
+    needs: keepalive
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-trigger this workflow immediately
+        run: gh workflow run "GoFile Keep Alive" --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ github.token }}
