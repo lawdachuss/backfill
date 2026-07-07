@@ -22,7 +22,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch codes and process all batches sequentially
+      - name: Restore progress cache
+        uses: actions/cache@v4
+        id: progress-cache
+        with:
+          path: gofile-keepalive/.progress
+          key: gofile-keepalive-progress-v1
+
+      - name: Run keepalive
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}

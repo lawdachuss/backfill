@@ -2,29 +2,18 @@ const API_BASE = 'https://api.gofile.io';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const LANG = 'en-US';
 const SALT = '9844d94d963d30';
-const WT_WINDOW = 14400; // 4 hours in seconds
+const WT_WINDOW = 14400;
 
 function sha256(msg) {
   const data = new TextEncoder().encode(msg);
-  return crypto.subtle.digest('SHA-256', data).then(h => {
-    return Array.from(new Uint8Array(h)).map(b => b.toString(16).padStart(2, '0')).join('');
-  });
+  return crypto.subtle.digest('SHA-256', data).then(h =>
+    Array.from(new Uint8Array(h)).map(b => b.toString(16).padStart(2, '0')).join('')
+  );
 }
 
 function websiteToken(accountToken, windowOffset = 0) {
   const window = Math.floor(Date.now() / 1000 / WT_WINDOW) + windowOffset;
-  const raw = `${UA}::${LANG}::${accountToken}::${window}::${SALT}`;
-  return sha256(raw);
-}
-
-async function createGuestToken() {
-  const resp = await fetch(`${API_BASE}/accounts`, {
-    method: 'POST',
-    headers: { 'User-Agent': UA, 'Origin': 'https://gofile.io', 'Accept': 'application/json' },
-  });
-  const body = await resp.json();
-  if (body.status === 'ok' && body.data?.token) return body.data.token;
-  return null;
+  return sha256(`${UA}::${LANG}::${accountToken}::${window}::${SALT}`);
 }
 
 async function fetchContents(code, token, wt) {
@@ -47,7 +36,6 @@ async function fetchContents(code, token, wt) {
 }
 
 async function getFileData(code, token) {
-  // Try current 4hr window, then previous window
   for (const offset of [0, -1]) {
     const wt = await websiteToken(token, offset);
     const body = await fetchContents(code, token, wt);
@@ -65,7 +53,8 @@ async function downloadViaCdn(children, code) {
     if (!child.link) continue;
     try {
       const resp = await fetch(child.link, {
-        headers: { 'User-Agent': UA, 'Range': 'bytes=0-524287', 'Referer': `https://gofile.io/d/${code}` },
+        headers: { 'User-Agent': UA, 'Range': 'bytes=0-262143', 'Referer': `https://gofile.io/d/${code}` },
+        signal: AbortSignal.timeout(20000),
       });
       if (resp.ok || resp.status === 206) downloadCount++;
     } catch {}
@@ -77,10 +66,34 @@ export default {
   async fetch(request) {
     const url = new URL(request.url);
     const code = url.searchParams.get('code');
+    const action = url.searchParams.get('action');
+
+    // Token endpoint: return a fresh guest token
+    if (action === 'token') {
+      const resp = await fetch(`${API_BASE}/accounts`, {
+        method: 'POST',
+        headers: { 'User-Agent': UA, 'Origin': 'https://gofile.io', 'Accept': 'application/json' },
+      });
+      const body = await resp.json();
+      if (body.status === 'ok' && body.data?.token) {
+        return new Response(body.data.token, { status: 200 });
+      }
+      return new Response('no-token', { status: 502 });
+    }
+
     if (!code) return new Response('missing code param', { status: 400 });
 
-    const token = await createGuestToken();
-    if (!token) return new Response('no-token', { status: 502 });
+    // Use provided token, or create one
+    let token = url.searchParams.get('token');
+    if (!token) {
+      const resp = await fetch(`${API_BASE}/accounts`, {
+        method: 'POST',
+        headers: { 'User-Agent': UA, 'Origin': 'https://gofile.io', 'Accept': 'application/json' },
+      });
+      const body = await resp.json();
+      if (body.status !== 'ok' || !body.data?.token) return new Response('no-token', { status: 502 });
+      token = body.data.token;
+    }
 
     const body = await getFileData(code, token);
     if (body.status !== 'ok') return new Response(`api:${body.status}`, { status: 200 });
