@@ -75,7 +75,7 @@ def extract_code(url: str) -> str:
     return m.group(1) if m else ""
 
 
-def try_opener(url: str, proxy: str = None, timeout: int = 8):
+def try_opener(url: str, proxy: str = None, timeout: int = 15):
     if proxy:
         handler = urllib.request.ProxyHandler({
             "http": f"http://{proxy}",
@@ -120,7 +120,7 @@ def process_codes_sequential(codes: list[str], proxies: list[str]) -> dict:
                         proxy = p
                         break
 
-            via = "proxy" if GOFILE_PROXY_URL else ("direct" if not proxy else proxy)
+            via = "cloudflare" if GOFILE_PROXY_URL else ("direct" if not proxy else proxy)
             log(f"[gofile-keepalive]   req {i+1}/{total}: {code} via {via} (attempt {attempt+1})")
             status, elapsed, err_str = try_opener(url, proxy)
 
@@ -185,7 +185,9 @@ def cmd_run(codes: list[str] = None):
         return
 
     proxies = []
-    if "--no-proxies" not in sys.argv:
+    if GOFILE_PROXY_URL:
+        log(f"[gofile-keepalive] Using Cloudflare Worker proxy: {GOFILE_PROXY_URL}")
+    elif "--no-proxies" not in sys.argv:
         log("[gofile-keepalive] Fetching proxy list...")
         proxies = fetch_proxies()
         log(f"[gofile-keepalive] Loaded {len(proxies)} proxies (on-demand, no pre-test)")
