@@ -66,16 +66,24 @@ def extract_code(url: str) -> str:
 
 
 def get_guest_token() -> str:
-    url = f"{GOFILE_PROXY_URL}?action=token" if GOFILE_PROXY_URL else f"https://api.gofile.io/accounts"
     if GOFILE_PROXY_URL:
-        req = urllib.request.Request(url)
+        url = f"{GOFILE_PROXY_URL}?action=token"
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/plain,*/*"})
     else:
+        url = "https://api.gofile.io/accounts"
         req = urllib.request.Request(url, method="POST", headers={
             "User-Agent": UA, "Origin": "https://gofile.io", "Accept": "application/json",
         })
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read().decode().strip()
+            body = resp.read().decode().strip()
+            if not body or body == "no-token":
+                log(f"[gofile-keepalive] Token fetch returned: {body}")
+                return ""
+            return body
+    except urllib.error.HTTPError as e:
+        log(f"[gofile-keepalive] Token fetch HTTP {e.code}: {e.read().decode()[:200]}")
+        return ""
     except Exception as e:
         log(f"[gofile-keepalive] Token fetch failed: {e}")
         return ""
