@@ -1,0 +1,45 @@
+name: GoFile Keep Alive
+
+on:
+  schedule:
+    - cron: '0 0 */6 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  distribute:
+    runs-on: ubuntu-latest
+    outputs:
+      batches: ${{ steps.list.outputs.batches }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch and split GoFile codes
+        id: list
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+        run: |
+          batches=$(python gofile-keepalive/keepalive.py --list)
+          echo "batches=$batches" >> $GITHUB_OUTPUT
+
+  keepalive:
+    needs: distribute
+    if: ${{ needs.distribute.outputs.batches != '[]' && needs.distribute.outputs.batches != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        batch: ${{ fromJson(needs.distribute.outputs.batches) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Process batch
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+        run: |
+          batch_json='${{ toJSON(matrix.batch) }}'
+          python gofile-keepalive/keepalive.py --batch "$batch_json"
