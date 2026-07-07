@@ -24,6 +24,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+          GOFILE_PROXY_URL: ${{ secrets.GOFILE_PROXY_URL }}
         run: |
           python gofile-keepalive/keepalive.py --list > batches.json
           echo "batches=$(cat batches.json)" >> $GITHUB_OUTPUT
@@ -43,5 +44,6 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+          GOFILE_PROXY_URL: ${{ secrets.GOFILE_PROXY_URL }}
           BATCH_CODES: ${{ toJSON(matrix.batch) }}
         run: python gofile-keepalive/keepalive.py --batch-env

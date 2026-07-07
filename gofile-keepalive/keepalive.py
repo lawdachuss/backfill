@@ -9,6 +9,7 @@ import urllib.error
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_API_KEY = os.environ.get("SUPABASE_API_KEY", "")
+GOFILE_PROXY_URL = os.environ.get("GOFILE_PROXY_URL", "").rstrip("/")
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
 PAGE_SIZE = 1000
 BATCH_SIZE = 500
@@ -106,7 +107,7 @@ def process_codes_sequential(codes: list[str], proxies: list[str]) -> dict:
     use_proxies = len(proxies) > 0
 
     for i, code in enumerate(codes):
-        url = f"https://gofile.io/d/{code}"
+        url = f"{GOFILE_PROXY_URL}?code={code}" if GOFILE_PROXY_URL else f"https://gofile.io/d/{code}"
         result = None
 
         for attempt in range(3):
@@ -119,7 +120,8 @@ def process_codes_sequential(codes: list[str], proxies: list[str]) -> dict:
                         proxy = p
                         break
 
-            log(f"[gofile-keepalive]   req {i+1}/{total}: {code} {'via ' + proxy if proxy else 'direct'} (attempt {attempt+1})")
+            via = "proxy" if GOFILE_PROXY_URL else ("direct" if not proxy else proxy)
+            log(f"[gofile-keepalive]   req {i+1}/{total}: {code} via {via} (attempt {attempt+1})")
             status, elapsed, err_str = try_opener(url, proxy)
 
             if status == 200 or status == 206:
