@@ -786,12 +786,15 @@ func generateMediaFromURL(cdnURL, filename string, fileSize int64, needThumb, ne
 	}
 	defer os.RemoveAll(tmpDir)
 
-	logf("  🔍 probing duration via ffprobe…")
+	logf("  🔍 probing duration + streams via ffprobe…")
+	hasVideo := urlHasVideoStream(cdnURL)
 	dur := ffprobeURLDuration(cdnURL)
-	if dur <= 0 && !urlHasVideoStream(cdnURL) {
+	if !hasVideo {
 		// Audio-only file (no video stream) — thumb/sprite/preview cannot be
-		// generated. Leave what we already have and bail out early rather than
-		// letting ffmpeg fail with "Output file does not contain any stream".
+		// generated. Bail out early rather than letting ffmpeg fail with
+		// "Output file does not contain any stream". We check unconditionally
+		// (not just when dur<=0) because ffprobe can still report a duration
+		// from the audio stream's metadata even when no video track exists.
 		errorf("  no video stream in source — skipping thumbnail/sprite/preview generation")
 		return
 	}
