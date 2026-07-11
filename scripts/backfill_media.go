@@ -443,19 +443,32 @@ func ffprobeBin() string {
 // rotates through the proxy pool on connection-level failures. A working
 // proxy is kept "sticky" for subsequent calls. Returns combined output.
 func runAVTool(ctx context.Context, bin string, args []string) ([]byte, error) {
+	// Runs the AV tool, separating stdout from stderr. stdout is returned on
+	// success (ffprobe parses it); stderr is embedded in the error so that
+	// connection/format diagnostics survive. This also prevents stderr warnings
+	// (e.g. "[aac] channel element duplicate") from corrupting ffprobe's
+	// numeric stdout and breaking strconv.ParseFloat.
+	run := func(proxy string) ([]byte, string, error) {
+		cmd := exec.CommandContext(ctx, bin, applyAVOpts(args, proxy)...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if proxy != "" {
+			cmd.Env = append(os.Environ(), proxyEnv(proxy)...)
+		}
+		err := cmd.Run()
+		return stdout.Bytes(), stderr.String(), err
+	}
+
 	// No pool / single direct candidate: run plainly.
 	if proxyPoolInstance == nil || proxyPoolInstance.size() <= 1 {
 		proxy := ""
 		if proxyPoolInstance != nil {
 			proxy = proxyPoolInstance.get()
 		}
-		cmd := exec.CommandContext(ctx, bin, applyAVOpts(args, proxy)...)
-		if proxy != "" {
-			cmd.Env = append(os.Environ(), proxyEnv(proxy)...)
-		}
-		out, err := cmd.CombinedOutput()
+		out, stderr, err := run(proxy)
 		if err != nil {
-			return nil, fmt.Errorf("%w\n--- %s output ---\n%s", err, bin, string(out))
+			return nil, fmt.Errorf("%w\n--- %s stderr ---\n%s", err, bin, stderr)
 		}
 		return out, nil
 	}
@@ -464,15 +477,11 @@ func runAVTool(ctx context.Context, bin string, args []string) ([]byte, error) {
 	var lastErr error
 	for i := 0; i < maxTries; i++ {
 		proxy := proxyPoolInstance.get()
-		cmd := exec.CommandContext(ctx, bin, applyAVOpts(args, proxy)...)
-		if proxy != "" {
-			cmd.Env = append(os.Environ(), proxyEnv(proxy)...)
-		}
-		out, err := cmd.CombinedOutput()
+		out, stderr, err := run(proxy)
 		if err == nil {
 			return out, nil
 		}
-		lastErr = fmt.Errorf("%w\n--- %s output ---\n%s", err, bin, string(out))
+		lastErr = fmt.Errorf("%w\n--- %s stderr ---\n%s", err, bin, stderr)
 		if !isConnFailure(lastErr) {
 			// Non-connection error (decode/format) — proxy won't help.
 			return nil, lastErr
@@ -517,9 +526,6 @@ func ffprobeURLDuration(videoURL string) float64 {
 				continue
 			}
 			errorf("  ffprobe duration failed: %v", err)
-			if out != nil && len(out) > 0 {
-				errorf("  ffprobe stderr: %s", string(out))
-			}
 			return 0
 		}
 		dur, parseErr := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
@@ -542,6 +548,32 @@ func estimateDurationFromSize(fileSizeBytes int64) float64 {
 	return float64(fileSizeBytes) / avgBitrate
 }
 
+// urlHasVideoStream reports whether a remote media URL contains at least one
+// video stream. Audio-only files (e.g. recordings that muxed without video)
+// cannot produce a thumbnail/sprite/preview, and we want to detect that cheaply
+// before invoking ffmpeg.
+func urlHasVideoStream(videoURL string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	out, err := runAVTool(ctx, ffprobeBin(), []string{
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=codec_type",
+		"-of", "csv=p=0",
+		"-timeout", "60000000",
+		videoURL,
+	})
+	if err != nil {
+		// On connection failure we can't tell — assume a video stream exists so
+		// callers don't skip a file they could otherwise process.
+		if isConnFailure(err) {
+			return true
+		}
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(out)), "video")
+}
+
 // generateMediaFromURL generates thumbnail, sprite, and preview for a video
 // reachable at cdnURL using FFmpeg HTTP range requests. No full download.
 func generateMediaFromURL(cdnURL, filename string, fileSize int64, needThumb, needSprite, needPreview bool) (thumbURL, spriteURL, previewURL string) {
@@ -554,6 +586,13 @@ func generateMediaFromURL(cdnURL, filename string, fileSize int64, needThumb, ne
 
 	logf("  🔍 probing duration via ffprobe…")
 	dur := ffprobeURLDuration(cdnURL)
+	if dur <= 0 && !urlHasVideoStream(cdnURL) {
+		// Audio-only file (no video stream) — thumb/sprite/preview cannot be
+		// generated. Leave what we already have and bail out early rather than
+		// letting ffmpeg fail with "Output file does not contain any stream".
+		errorf("  no video stream in source — skipping thumbnail/sprite/preview generation")
+		return
+	}
 	if dur <= 0 {
 		logf("  ffprobe failed, estimating duration from file size…")
 		dur = estimateDurationFromSize(fileSize)
@@ -620,8 +659,8 @@ const (
 	urlSpriteRows          = 4
 	urlSpriteN             = urlSpriteCols * urlSpriteRows // 16
 	urlPreviewW            = 320
-	urlPreviewDur          = 9.0  // total preview seconds
-	urlPreviewSegs         = 16   // number of clips
+	urlPreviewDur          = 9.0 // total preview seconds
+	urlPreviewSegs         = 16  // number of clips
 )
 
 // urlGenThumbnail seeks to 15% of the video and grabs one frame.
@@ -647,6 +686,7 @@ func urlGenThumbnail(cdnURL string, dur float64, tmpDir, filename string) (strin
 		"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2",
 			urlThumbW, urlThumbH, urlThumbW, urlThumbH),
 		"-c:v", "mjpeg", "-q:v", "3",
+		"-strict", "unofficial", "-threads", "1",
 		thumbPath,
 	)
 	if err != nil {
@@ -692,6 +732,7 @@ func urlGenSprite(cdnURL string, dur float64, tmpDir, filename string) (string, 
 				"scale=%d:%d:force_original_aspect_ratio=decrease:flags=lanczos,pad=%d:%d:(ow-iw)/2:(oh-ih)/2",
 				urlSpriteW, urlSpriteH, urlSpriteW, urlSpriteH),
 			"-c:v", "mjpeg", "-q:v", "3",
+			"-strict", "unofficial", "-threads", "1",
 			framePath,
 		)
 		cancel()
@@ -722,6 +763,7 @@ func urlGenSprite(cdnURL string, dur float64, tmpDir, filename string) (string, 
 		"-filter_complex", filterComplex,
 		"-map", "[out]",
 		"-c:v", "mjpeg", "-q:v", "3",
+		"-strict", "unofficial", "-threads", "1",
 		spritePath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -876,8 +918,6 @@ func urlGenPreview(cdnURL string, dur float64, tmpDir, filename string) (string,
 	return remoteURL, nil
 }
 
-
-
 // ─── SeekStreaming thumbnail ──────────────────────────────────────────────────
 
 func seekPosterURL(embedURL, seekKey string) string {
@@ -925,8 +965,8 @@ func processOne(item workItem, seekKey, stLogin, stKey string, dryRun, thumbOnly
 	rec := item.rec
 	atomic.AddInt64(&cntTotal, 1)
 
-	needThumb   := rec.ThumbnailURL == ""
-	needSprite  := rec.SpriteURL == ""
+	needThumb := rec.ThumbnailURL == ""
+	needSprite := rec.SpriteURL == ""
 	needPreview := rec.PreviewURL == ""
 
 	if !needThumb && !needSprite && !needPreview {
@@ -937,8 +977,8 @@ func processOne(item workItem, seekKey, stLogin, stKey string, dryRun, thumbOnly
 	logf("%-60s  [thumb=%v sprite=%v preview=%v]",
 		rec.Filename, needThumb, needSprite, needPreview)
 
-	thumb   := rec.ThumbnailURL
-	sprite  := rec.SpriteURL
+	thumb := rec.ThumbnailURL
+	sprite := rec.SpriteURL
 	preview := rec.PreviewURL
 
 	// ── Phase 1: SeekStreaming poster → thumbnail (zero downloads needed) ─────
@@ -1022,22 +1062,22 @@ func processOne(item workItem, seekKey, stLogin, stKey string, dryRun, thumbOnly
 // triggerWorkflowDispatch triggers a workflow dispatch on the specified repository.
 func triggerWorkflowDispatch(repo, token string) error {
 	logf("Triggering workflow_dispatch for %s...", repo)
-	
+
 	// Default to main or get from GITHUB_REF_NAME
 	ref := os.Getenv("GITHUB_REF_NAME")
 	if ref == "" {
 		ref = "main"
 	}
-	
+
 	url := fmt.Sprintf("https://api.github.com/repos/%s/actions/workflows/backfill.yml/dispatches", repo)
-	
+
 	body, err := json.Marshal(map[string]string{
 		"ref": ref,
 	})
 	if err != nil {
 		return err
 	}
-	
+
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -1045,13 +1085,13 @@ func triggerWorkflowDispatch(repo, token string) error {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "Go-GitHub-Trigger")
-	
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
@@ -1074,10 +1114,10 @@ func main() {
 	if supabaseKey == "" {
 		supabaseKey = os.Getenv("SUPABASE_API_KEY")
 	}
-	seekKey    := os.Getenv("SEEKSTREAMING_KEY")
+	seekKey := os.Getenv("SEEKSTREAMING_KEY")
 	ffmpegPath := os.Getenv("FFMPEG_PATH")
-	stLogin    := os.Getenv("STREAMTAPE_LOGIN")
-	stKey      := os.Getenv("STREAMTAPE_API_KEY")
+	stLogin := os.Getenv("STREAMTAPE_LOGIN")
+	stKey := os.Getenv("STREAMTAPE_API_KEY")
 
 	if supabaseURL == "" || supabaseKey == "" {
 		log.Fatal("SUPABASE_URL and SUPABASE_API_KEY (or SUPABASE_SERVICE_ROLE_KEY) must be set")
