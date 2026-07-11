@@ -34,6 +34,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
           GOFILE_PROXY_URL: ${{ secrets.GOFILE_PROXY_URL }}
+          PROXY_SOURCE: ${{ secrets.PROXY_SOURCE }}
         run: python gofile-keepalive/keepalive.py
 
   retrigger:
