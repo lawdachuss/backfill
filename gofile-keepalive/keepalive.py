@@ -11,7 +11,7 @@ BUILTIN_PROXY_SOURCES = [
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/hookzof/socks5_list/master/http.txt",
+    "https://raw.githubusercontent.com/rdavydov/proxy-list/main/http.txt",
     "https://api.proxyscrape.com/v2/?request=getproxies&proxytype=http&timeout=5000&country=all",
     "https://www.proxy-list.download/api/v1/get?type=https",
 ]
