@@ -942,23 +942,42 @@ func urlGenSprite(cdnURL string, dur float64, tmpDir, filename string) (string, 
 		}
 		framePath := filepath.Join(tmpDir, fmt.Sprintf("frame_%02d.jpg", i))
 
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		err := ffmpegRun(ctx,
-			"-y",
-			"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
-			"-ss", fmt.Sprintf("%.2f", pos),
-			"-i", cdnURL,
-			"-vframes", "1",
-			"-vf", fmt.Sprintf(
-				"scale=%d:%d:force_original_aspect_ratio=decrease:flags=lanczos,pad=%d:%d:(ow-iw)/2:(oh-ih)/2",
-				urlSpriteW, urlSpriteH, urlSpriteW, urlSpriteH),
-			"-c:v", "mjpeg", "-q:v", "3",
-			"-strict", "unofficial", "-threads", "1",
-			framePath,
-		)
-		cancel()
-		if err != nil {
-			return "", fmt.Errorf("sprite frame %d: %w", i, err)
+		// Some CDN deep-seeks (Streamtape range requests) can return exit 0
+		// yet write no frame file. Verify the file exists & is non-empty, and
+		// retry — otherwise xstack later fails cryptically with "No such file".
+		var frameErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			e := ffmpegRun(ctx,
+				"-y",
+				"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
+				"-ss", fmt.Sprintf("%.2f", pos),
+				"-i", cdnURL,
+				"-vframes", "1",
+				"-vf", fmt.Sprintf(
+					"scale=%d:%d:force_original_aspect_ratio=decrease:flags=lanczos,pad=%d:%d:(ow-iw)/2:(oh-ih)/2",
+					urlSpriteW, urlSpriteH, urlSpriteW, urlSpriteH),
+				"-c:v", "mjpeg", "-q:v", "3",
+				"-strict", "unofficial", "-threads", "1",
+				framePath,
+			)
+			cancel()
+			frameErr = e
+			if e == nil {
+				if fi, stErr := os.Stat(framePath); stErr == nil && fi.Size() > 0 {
+					frameErr = nil
+					break
+				}
+				frameErr = fmt.Errorf("frame file not written (0 bytes or missing)")
+			}
+			if attempt < 2 {
+				backoff := time.Duration(2<<uint(attempt)) * time.Second
+				logf("  sprite frame %d seek produced no file (attempt %d/3), retrying in %v", i+1, attempt+1, backoff)
+				time.Sleep(backoff)
+			}
+		}
+		if frameErr != nil {
+			return "", fmt.Errorf("sprite frame %d: %w", i, frameErr)
 		}
 		framePaths = append(framePaths, framePath)
 		logf("  sprite frame %d/%d done", i+1, urlSpriteN)
