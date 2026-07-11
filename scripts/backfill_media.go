@@ -695,9 +695,25 @@ func runAVTool(ctx context.Context, bin string, args []string) ([]byte, error) {
 }
 
 // ffmpegRun runs ffmpeg with the given arguments and returns any error.
+// Proxy / User-Agent / Referer options are applied globally (via applyAVOpts) —
+// correct for commands whose inputs are remote (the CDN URL).
 func ffmpegRun(ctx context.Context, args ...string) error {
 	_, err := runAVTool(ctx, ffmpegBin(), args)
 	return err
+}
+
+// ffmpegRunLocal runs ffmpeg on LOCAL files (sprite xstack, preview concat)
+// without injecting proxy/User-Agent/Referer options. Those are input options
+// that attach to the first -i, and for local-file assembly the first input is a
+// local image/clip — which rejects -user_agent ("Option user_agent not found").
+func ffmpegRunLocal(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w\n--- ffmpeg stderr ---\n%s", err, stderr.String())
+	}
+	return nil
 }
 
 // ffprobeURLDuration probes the duration of a remote video URL using ffprobe.
@@ -973,7 +989,7 @@ func urlGenSprite(cdnURL string, dur float64, tmpDir, filename string) (string, 
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	if err := ffmpegRun(ctx, tileArgs...); err != nil {
+	if err := ffmpegRunLocal(ctx, tileArgs...); err != nil {
 		return "", fmt.Errorf("xstack: %w", err)
 	}
 
@@ -1073,7 +1089,7 @@ func urlGenPreview(cdnURL string, dur float64, tmpDir, filename string) (string,
 	previewPath := filepath.Join(tmpDir, filename+".preview.mp4")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	if err := ffmpegRun(ctx,
+	if err := ffmpegRunLocal(ctx,
 		"-y",
 		"-f", "concat", "-safe", "0", "-i", concatListPath,
 		"-c", "copy",
@@ -1081,7 +1097,7 @@ func urlGenPreview(cdnURL string, dur float64, tmpDir, filename string) (string,
 		previewPath,
 	); err != nil {
 		logf("  concat with stream copy failed, retrying with re-encode: %v", err)
-		if err2 := ffmpegRun(ctx,
+		if err2 := ffmpegRunLocal(ctx,
 			"-y",
 			"-f", "concat", "-safe", "0", "-i", concatListPath,
 			"-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
