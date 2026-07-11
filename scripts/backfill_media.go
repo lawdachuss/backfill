@@ -233,6 +233,202 @@ func ffmpegBin() string {
 	return "ffmpeg"
 }
 
+// ffmpegUserAgent overrides ffmpeg's default "Lavf/..." User-Agent. Many CDNs
+// (e.g. Streamtape) refuse non-browser clients at the HTTP layer, so a browser
+// UA is required once the TCP connection itself is reachable.
+var ffmpegUserAgent = func() string {
+	if v := os.Getenv("FFMPEG_USER_AGENT"); v != "" {
+		return v
+	}
+	return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+}()
+
+// ffmpegReferer sets the Referer header for CDN requests (some hosts key
+// access off it). Empty by default; override via FFMPEG_REFERER if needed.
+var ffmpegReferer = os.Getenv("FFMPEG_REFERER")
+
+// ─── Proxy pool (auto-fetched, rotating) ──────────────────────────────────
+//
+// Streamtape's media CDN blocks the runner's direct (datacenter) IP, so we
+// fetch a list of egress proxies and rotate through them on connection
+// failures. Once a working proxy is found it is kept "sticky" for the rest of
+// the run to avoid re-scanning the pool on every ffmpeg/ffprobe call.
+
+type proxyPool struct {
+	mu   sync.Mutex
+	list []string // "" means direct (no proxy)
+	idx  int      // current candidate index
+}
+
+func (p *proxyPool) size() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.list)
+}
+
+func (p *proxyPool) get() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.list) == 0 {
+		return ""
+	}
+	return p.list[p.idx%len(p.list)]
+}
+
+func (p *proxyPool) next() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.list) == 0 {
+		return
+	}
+	p.idx = (p.idx + 1) % len(p.list)
+}
+
+var proxyPoolInstance *proxyPool
+
+// normalizeProxy ensures the proxy string has a scheme ffmpeg understands.
+func normalizeProxy(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if !strings.Contains(s, "://") {
+		s = "http://" + s
+	}
+	return s
+}
+
+// maskProxy hides credentials when logging a proxy URL.
+func maskProxy(s string) string {
+	if s == "" {
+		return "(direct)"
+	}
+	if i := strings.Index(s, "@"); i >= 0 {
+		head := s[:i]
+		tail := s[i:]
+		if c := strings.Index(head, "://"); c >= 0 {
+			return head[:c+3] + "***:***" + tail
+		}
+		return "***:***" + tail
+	}
+	return s
+}
+
+// proxyEnv returns the process env overrides for a given proxy. Empty proxy
+// clears any inherited proxy so "direct" truly is direct.
+func proxyEnv(proxy string) []string {
+	if proxy == "" {
+		return []string{"HTTP_PROXY=", "HTTPS_PROXY=", "http_proxy=", "https_proxy="}
+	}
+	return []string{
+		"HTTP_PROXY=" + proxy,
+		"HTTPS_PROXY=" + proxy,
+		"http_proxy=" + proxy,
+		"https_proxy=" + proxy,
+	}
+}
+
+// applyAVOpts prepends proxy / User-Agent / Referer options. These are
+// protocol/demuxer options and must precede the input they apply to.
+func applyAVOpts(args []string, proxy string) []string {
+	var pre []string
+	if proxy != "" {
+		pre = append(pre, "-http_proxy", proxy, "-https_proxy", proxy)
+	}
+	if ffmpegUserAgent != "" {
+		pre = append(pre, "-user_agent", ffmpegUserAgent)
+	}
+	if ffmpegReferer != "" {
+		pre = append(pre, "-referer", ffmpegReferer)
+	}
+	if len(pre) == 0 {
+		return args
+	}
+	return append(pre, args...)
+}
+
+// fetchProxyList pulls a list of proxies from PROXY_SOURCE. Supports both a
+// plain-text list (one proxy per line, "ip:port" or "scheme://ip:port") and a
+// JSON array of strings. Returns nil if unset or unreachable.
+func fetchProxyList() []string {
+	src := os.Getenv("PROXY_SOURCE")
+	if src == "" {
+		return nil
+	}
+	logf("  fetching proxy list from %s", src)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(src)
+	if err != nil {
+		errorf("  proxy fetch failed: %v", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		errorf("  proxy fetch read failed: %v", err)
+		return nil
+	}
+	var out []string
+	var asArray []string
+	if json.Unmarshal(body, &asArray) == nil && len(asArray) > 0 {
+		for _, p := range asArray {
+			if n := normalizeProxy(p); n != "" {
+				out = append(out, n)
+			}
+		}
+	} else {
+		for _, line := range strings.Split(string(body), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			// Drop any trailing labels some lists append after whitespace.
+			if sp := strings.Fields(line); len(sp) > 0 {
+				line = sp[0]
+			}
+			if n := normalizeProxy(line); n != "" {
+				out = append(out, n)
+			}
+		}
+	}
+	logf("  loaded %d proxies from source", len(out))
+	return out
+}
+
+// buildProxyPool assembles the proxy pool: explicit FFMPEG_PROXY, the fetched
+// PROXY_SOURCE list, and optionally a direct connection (PROXY_ALLOW_DIRECT).
+func buildProxyPool() *proxyPool {
+	p := &proxyPool{}
+	if v := normalizeProxy(os.Getenv("FFMPEG_PROXY")); v != "" {
+		p.list = append(p.list, v)
+	}
+	if list := fetchProxyList(); len(list) > 0 {
+		p.list = append(p.list, list...)
+	}
+	if strings.EqualFold(os.Getenv("PROXY_ALLOW_DIRECT"), "true") || os.Getenv("PROXY_ALLOW_DIRECT") == "1" {
+		p.list = append(p.list, "") // direct connection candidate
+	}
+	if len(p.list) == 0 {
+		p.list = []string{""} // no proxies configured → direct only
+	}
+	return p
+}
+
+// isConnFailure reports whether an ffmpeg/ffprobe error is a low-level TCP
+// connect failure (CDN host unreachable / IP blocked) rather than a transient
+// decode error. These are not worth retrying against a blocked runner IP.
+func isConnFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Error number -138") ||
+		strings.Contains(msg, "Connection to tcp") ||
+		strings.Contains(msg, "Connection failed") ||
+		strings.Contains(msg, "Could not connect") ||
+		strings.Contains(msg, "Network is unreachable")
+}
+
 // ffprobeBin returns the ffprobe binary path derived from ffmpegBin.
 func ffprobeBin() string {
 	bin := ffmpegBin()
@@ -243,14 +439,54 @@ func ffprobeBin() string {
 	return "ffprobe"
 }
 
+// runAVTool runs an AV tool (ffmpeg/ffprobe) applying proxy/UA/referer, and
+// rotates through the proxy pool on connection-level failures. A working
+// proxy is kept "sticky" for subsequent calls. Returns combined output.
+func runAVTool(ctx context.Context, bin string, args []string) ([]byte, error) {
+	// No pool / single direct candidate: run plainly.
+	if proxyPoolInstance == nil || proxyPoolInstance.size() <= 1 {
+		proxy := ""
+		if proxyPoolInstance != nil {
+			proxy = proxyPoolInstance.get()
+		}
+		cmd := exec.CommandContext(ctx, bin, applyAVOpts(args, proxy)...)
+		if proxy != "" {
+			cmd.Env = append(os.Environ(), proxyEnv(proxy)...)
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("%w\n--- %s output ---\n%s", err, bin, string(out))
+		}
+		return out, nil
+	}
+
+	const maxTries = 6
+	var lastErr error
+	for i := 0; i < maxTries; i++ {
+		proxy := proxyPoolInstance.get()
+		cmd := exec.CommandContext(ctx, bin, applyAVOpts(args, proxy)...)
+		if proxy != "" {
+			cmd.Env = append(os.Environ(), proxyEnv(proxy)...)
+		}
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return out, nil
+		}
+		lastErr = fmt.Errorf("%w\n--- %s output ---\n%s", err, bin, string(out))
+		if !isConnFailure(lastErr) {
+			// Non-connection error (decode/format) — proxy won't help.
+			return nil, lastErr
+		}
+		errorf("  CDN connection blocked via proxy %s, rotating (%d/%d)…", maskProxy(proxy), i+1, maxTries)
+		proxyPoolInstance.next()
+	}
+	return nil, lastErr
+}
+
 // ffmpegRun runs ffmpeg with the given arguments and returns any error.
 func ffmpegRun(ctx context.Context, args ...string) error {
-	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%w\n--- ffmpeg output ---\n%s", err, string(out))
-	}
-	return nil
+	_, err := runAVTool(ctx, ffmpegBin(), args)
+	return err
 }
 
 // ffprobeURLDuration probes the duration of a remote video URL using ffprobe.
@@ -259,7 +495,7 @@ func ffmpegRun(ctx context.Context, args ...string) error {
 func ffprobeURLDuration(videoURL string) float64 {
 	for attempt := 0; attempt < 3; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		out, err := exec.CommandContext(ctx, ffprobeBin(),
+		out, err := runAVTool(ctx, ffprobeBin(), []string{
 			"-v", "error",
 			"-analyzeduration", "200M",
 			"-probesize", "200M",
@@ -267,9 +503,13 @@ func ffprobeURLDuration(videoURL string) float64 {
 			"-of", "default=noprint_wrappers=1:nokey=1",
 			"-timeout", "120000000",
 			videoURL,
-		).Output()
+		})
 		cancel()
 		if err != nil {
+			if isConnFailure(err) {
+				errorf("  ffprobe duration failed (CDN connection blocked, -138): %v", err)
+				return 0
+			}
 			if attempt < 2 {
 				backoff := time.Duration(2<<uint(attempt)) * time.Second
 				errorf("  ffprobe duration failed (attempt %d/3), retrying in %v: %v", attempt+1, backoff, err)
@@ -536,6 +776,10 @@ func urlGenPreview(cdnURL string, dur float64, tmpDir, filename string) (string,
 			)
 			cancel()
 			if clipErr == nil {
+				break
+			}
+			if isConnFailure(clipErr) {
+				errorf("  preview clip %d failed (CDN connection blocked, -138), not retrying: %v", i, clipErr)
 				break
 			}
 			if attempt < 2 {
@@ -857,6 +1101,14 @@ func main() {
 		config.SetFFmpegPath(ffmpegPath)
 	}
 
+	// Build the proxy pool (auto-fetches from PROXY_SOURCE when set).
+	proxyPoolInstance = buildProxyPool()
+	if proxyPoolInstance.size() == 1 && proxyPoolInstance.get() == "" {
+		logf("No proxy configured — connecting directly to CDN.")
+	} else {
+		logf("Proxy pool ready: %d candidate(s) (rotating on connection failure).", proxyPoolInstance.size())
+	}
+
 	client := database.NewClient(supabaseURL, supabaseKey)
 
 	logf("Fetching all recordings…")
@@ -1014,4 +1266,17 @@ func main() {
 	fmt.Printf("  ✗ Failed:             %d\n", atomic.LoadInt64(&cntFailed))
 	fmt.Printf("  ⏭ Already complete:   %d\n", atomic.LoadInt64(&cntSkipped))
 	fmt.Println("═══════════════════════════════════════════════════")
+
+	// Fail the run loudly when an overwhelming majority of items failed
+	// (typically the CDN being unreachable from the runner IP). GitHub would
+	// otherwise mark the job green even though nothing was backfilled.
+	total := atomic.LoadInt64(&cntTotal)
+	failed := atomic.LoadInt64(&cntFailed)
+	if total > 0 {
+		pct := failed * 100 / total
+		if pct >= 90 {
+			errorf("Backfill largely failed (%d/%d = %d%%); exiting non-zero so the run is flagged.", failed, total, pct)
+			os.Exit(1)
+		}
+	}
 }
