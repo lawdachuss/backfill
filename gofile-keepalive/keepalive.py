@@ -4,6 +4,20 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_API_KEY = os.environ.get("SUPABASE_API_KEY", "")
 GOFILE_PROXY_URL = os.environ.get("GOFILE_PROXY_URL", "").rstrip("/")
 PROXY_SOURCE = os.environ.get("PROXY_SOURCE", "").strip()
+# Built-in public proxy-list sources. When PROXY_SOURCE is not set, the script
+# auto-aggregates proxies from these endpoints so it never hard-depends on a
+# manually configured secret. Override with PROXY_SOURCE (comma-separated URLs).
+BUILTIN_PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/http.txt",
+    "https://api.proxyscrape.com/v2/?request=getproxies&proxytype=http&timeout=5000&country=all",
+    "https://www.proxy-list.download/api/v1/get?type=https",
+]
+# Max proxies tried per request before giving up (working ones stay sticky).
+MAX_PROXY_TRIES = 12
+PROXY_TIMEOUT = 12
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
 PAGE_SIZE = 1000
 PROGRESS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".progress")
@@ -22,20 +36,16 @@ def normalize_proxy(s: str) -> str:
     return s
 
 
-def fetch_proxy_list() -> list:
-    """Auto-fetch a pool of egress proxies from PROXY_SOURCE. Supports both a
+def fetch_proxy_list(source: str) -> list:
+    """Fetch a pool of egress proxies from a single source URL. Supports both a
     plain-text list (one proxy per line, "ip:port" or "scheme://ip:port") and a
-    JSON array of strings. Returns [] when unset or unreachable. This lets the
-    keep-alive reach GoFile without the manual GOFILE_PROXY_URL worker secret."""
-    if not PROXY_SOURCE:
-        return []
-    log("[gofile-keepalive] Fetching proxy list from PROXY_SOURCE...")
+    JSON array of strings. Returns [] when unreachable."""
     try:
-        req = urllib.request.Request(PROXY_SOURCE, headers={"User-Agent": UA, "Accept": "*/*"})
+        req = urllib.request.Request(source, headers={"User-Agent": UA, "Accept": "*/*"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             body = resp.read().decode()
     except Exception as e:
-        log(f"[gofile-keepalive] Proxy list fetch failed: {e}")
+        log(f"[gofile-keepalive] Proxy list fetch failed ({source}): {e}")
         return []
     out = []
     try:
@@ -45,7 +55,7 @@ def fetch_proxy_list() -> list:
                 n = normalize_proxy(str(p))
                 if n:
                     out.append(n)
-            log(f"[gofile-keepalive] Loaded {len(out)} proxies (JSON)")
+            log(f"[gofile-keepalive] Loaded {len(out)} proxies (JSON) from {source}")
             return out
     except Exception:
         pass
@@ -58,7 +68,28 @@ def fetch_proxy_list() -> list:
         n = normalize_proxy(line)
         if n:
             out.append(n)
-    log(f"[gofile-keepalive] Loaded {len(out)} proxies (text)")
+    log(f"[gofile-keepalive] Loaded {len(out)} proxies (text) from {source}")
+    return out
+
+
+def fetch_proxy_sources() -> list:
+    """Auto-aggregate proxies from PROXY_SOURCE (if set, comma-separated) or the
+    built-in public proxy-list endpoints. De-duplicates across sources."""
+    sources = []
+    if PROXY_SOURCE:
+        sources = [s.strip() for s in PROXY_SOURCE.split(",") if s.strip()]
+        log("[gofile-keepalive] Using PROXY_SOURCE override for proxy list.")
+    else:
+        sources = list(BUILTIN_PROXY_SOURCES)
+        log("[gofile-keepalive] No PROXY_SOURCE set — auto-fetching built-in proxy lists.")
+    seen = set()
+    out = []
+    for src in sources:
+        for p in fetch_proxy_list(src):
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+    log(f"[gofile-keepalive] Aggregated {len(out)} unique proxies from {len(sources)} source(s).")
     return out
 
 
@@ -143,7 +174,7 @@ def extract_code(url: str) -> str:
 
 
 def get_guest_token(proxy_pool=None) -> str:
-    # Worker path (Cloudflare bypass) — primary when configured.
+    # Worker path (Cloudflare bypass) — tried first when configured.
     if GOFILE_PROXY_URL:
         url = f"{GOFILE_PROXY_URL}?action=token"
         req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/plain,*/*"})
@@ -152,17 +183,18 @@ def get_guest_token(proxy_pool=None) -> str:
                 body = resp.read().decode().strip()
                 if not body or body == "no-token":
                     log(f"[gofile-keepalive] Token fetch returned: {body}")
-                    return ""
-                return body
+                else:
+                    return body
         except urllib.error.HTTPError as e:
             log(f"[gofile-keepalive] Token fetch HTTP {e.code}: {e.read().decode()[:200]}")
-            return ""
         except Exception as e:
             log(f"[gofile-keepalive] Token fetch failed: {e}")
-            return ""
-    # Direct path through the rotating proxy pool (no worker configured).
+        # Fall through to the auto-fetched proxy pool on any worker failure.
+        if proxy_pool and proxy_pool.size():
+            log("[gofile-keepalive] Worker token fetch failed — falling back to proxy pool.")
+    # Direct path through the rotating proxy pool (no worker / worker failed).
     url = "https://api.gofile.io/accounts"
-    attempts = proxy_pool.size() if (proxy_pool and proxy_pool.size()) else 1
+    attempts = min(proxy_pool.size(), MAX_PROXY_TRIES) if (proxy_pool and proxy_pool.size()) else 1
     last_err = ""
     for _ in range(attempts):
         proxy = proxy_pool.get() if proxy_pool else None
@@ -170,7 +202,7 @@ def get_guest_token(proxy_pool=None) -> str:
             "User-Agent": UA, "Origin": "https://gofile.io", "Accept": "application/json",
         })
         try:
-            with open_request(req, proxy, 30) as resp:
+            with open_request(req, proxy, PROXY_TIMEOUT) as resp:
                 body = resp.read().decode().strip()
                 if not body or body == "no-token":
                     log(f"[gofile-keepalive] Token fetch returned: {body}")
@@ -189,9 +221,9 @@ def get_guest_token(proxy_pool=None) -> str:
     return ""
 
 
-def visit_page(code: str, token: str, proxy_pool=None, timeout: int = 30):
+def visit_page(code: str, token: str, proxy_pool=None, timeout: int = 20):
     base = f"{GOFILE_PROXY_URL}?code={code}&token={token}" if GOFILE_PROXY_URL else f"https://gofile.io/d/{code}"
-    attempts = proxy_pool.size() if (proxy_pool and proxy_pool.size()) else 1
+    attempts = min(proxy_pool.size(), MAX_PROXY_TRIES) if (proxy_pool and proxy_pool.size()) else 1
     last = (0, 0.0, "")
     for _ in range(attempts):
         proxy = proxy_pool.get() if proxy_pool else None
@@ -265,15 +297,15 @@ def run():
         log("[gofile-keepalive] No progress or codes changed — starting fresh")
 
     # Build the egress proxy pool. The GOFILE_PROXY_URL worker takes priority
-    # when set; otherwise we auto-fetch a rotating pool from PROXY_SOURCE so the
-    # job no longer depends on a manually-configured worker secret.
-    proxy_pool = ProxyPool(fetch_proxy_list())
+    # when set; otherwise we auto-fetch a rotating pool (PROXY_SOURCE override or
+    # built-in public lists) so the job never depends on a manual secret.
+    proxy_pool = ProxyPool(fetch_proxy_sources())
     if GOFILE_PROXY_URL:
         log("[gofile-keepalive] Using GOFILE_PROXY_URL worker (primary path).")
     elif proxy_pool.size():
         log(f"[gofile-keepalive] No worker set — using {proxy_pool.size()} auto-fetched proxies.")
     else:
-        log("[gofile-keepalive] WARNING: no GOFILE_PROXY_URL and no PROXY_SOURCE — "
+        log("[gofile-keepalive] WARNING: no GOFILE_PROXY_URL and no proxies fetched — "
             "hitting GoFile directly (may be Cloudflare-blocked).")
 
     # Get guest token once, reuse for all codes (retry transient 5xx)
