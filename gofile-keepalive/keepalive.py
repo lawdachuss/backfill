@@ -112,6 +112,22 @@ def visit_page(code: str, token: str, timeout: int = 30):
         return 0, time.time() - start, str(e)[:60]
 
 
+def fetch_guest_token_with_retry(max_attempts: int = 6) -> str:
+    """Fetch a GoFile guest token, retrying transient failures (e.g. Cloudflare
+    5xx while the API is flapping) with exponential backoff. Returns '' only
+    after exhausting all attempts."""
+    for attempt in range(1, max_attempts + 1):
+        token = get_guest_token()
+        if token:
+            return token
+        wait = min(2 ** attempt, 60)
+        log(f"[gofile-keepalive] Guest token fetch failed (attempt {attempt}/{max_attempts}), "
+            f"retrying in {wait}s…")
+        if attempt < max_attempts:
+            time.sleep(wait)
+    return ""
+
+
 def run():
     log("[gofile-keepalive] Fetching all GoFile links from Supabase...")
     links = get_all_gofile_links()
@@ -139,11 +155,11 @@ def run():
     else:
         log("[gofile-keepalive] No progress or codes changed — starting fresh")
 
-    # Get guest token once, reuse for all codes
+    # Get guest token once, reuse for all codes (retry transient 5xx)
     log("[gofile-keepalive] Getting guest token...")
-    token = get_guest_token()
+    token = fetch_guest_token_with_retry()
     if not token:
-        log("[gofile-keepalive] FATAL: could not get guest token")
+        log("[gofile-keepalive] FATAL: could not get guest token after retries")
         sys.exit(1)
     log(f"[gofile-keepalive] Got guest token: {token[:20]}...")
 
@@ -160,9 +176,9 @@ def run():
 
         if need_token_refresh:
             log("[gofile-keepalive] Refreshing guest token...")
-            token = get_guest_token()
+            token = fetch_guest_token_with_retry()
             if not token:
-                log("[gofile-keepalive] FATAL: could not refresh guest token")
+                log("[gofile-keepalive] FATAL: could not refresh guest token after retries")
                 sys.exit(1)
             need_token_refresh = False
 

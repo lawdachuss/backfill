@@ -38,7 +38,10 @@ jobs:
 
   retrigger:
     needs: keepalive
-    if: success()
+    # Keep the self-sustaining chain alive even if a single run fails
+    # (e.g. a transient GoFile 5xx). The cron in `on:` still provides a
+    # backstop every 6h if the proxy is down for an extended outage.
+    if: success() || failure()
     runs-on: ubuntu-latest
     steps:
       - name: Re-trigger this workflow immediately
