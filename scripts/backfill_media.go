@@ -995,6 +995,11 @@ func processOne(item workItem, seekKey, stLogin, stKey string, dryRun, thumbOnly
 	// No full file download — FFmpeg seeks via HTTP range requests.
 	if !thumbOnly && (needThumb || needSprite || needPreview) {
 		stURL := item.links["Streamtape"]
+		// Fallback: many recordings carry their Streamtape URL in the
+		// recording's embed_url rather than in the upload_links table.
+		if stURL == "" && strings.Contains(rec.EmbedURL, "streamtape") {
+			stURL = rec.EmbedURL
+		}
 		if stURL == "" {
 			errorf("  no Streamtape link — skipping %s", rec.Filename)
 			atomic.AddInt64(&cntFailed, 1)
