@@ -26,6 +26,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -110,6 +112,10 @@ func errorf(format string, a ...interface{}) {
 
 // stHTTPClient is a shared HTTP client for Streamtape API calls.
 var stHTTPClient = &http.Client{Timeout: 60 * time.Minute}
+
+// goFileProxyURL, when set, routes GoFile resolution through the Cloudflare
+// Worker proxy (GOFILE_PROXY_URL) instead of calling the GoFile API directly.
+var goFileProxyURL string
 
 func httpGetJSON(rawURL string) (map[string]interface{}, error) {
 	req, _ := http.NewRequest("GET", rawURL, nil)
@@ -211,6 +217,202 @@ func getStreamtapeDirectURL(stEmbedURL, stLogin, stKey string) (string, int64, e
 		return "", 0, fmt.Errorf("no direct URL from Streamtape: %v", dlData)
 	}
 	return "", 0, fmt.Errorf("failed to get direct URL from Streamtape after retries")
+}
+
+// ─── GoFile direct-URL resolver ───────────────────────────────────────────────
+//
+// GoFile exposes a REST API (no JavaScript challenge), so it can be resolved in
+// pure Go — unlike Mixdrop/VOE/StreamWish/DoodStream which require a browser.
+// Flow mirrors the Cloudflare Worker in gofile-keepalive/worker.js:
+//   1. POST /accounts → guest token
+//   2. GET /contents/{code} with an X-Website-Token (sha256 of a salted window)
+//   3. return the first file child's direct `link`
+
+const (
+	goFileAPIBase         = "https://api.gofile.io"
+	goFileWebsiteTokenSalt = "9844d94d963d30"
+	goFileLang            = "en-US"
+	goFileWindowSeconds   = 14400
+)
+
+func goFileWebsiteToken(accountToken string, windowOffset int) string {
+	window := time.Now().Unix()/goFileWindowSeconds + int64(windowOffset)
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s::%s::%s::%d::%s",
+		ffmpegUserAgent, goFileLang, accountToken, window, goFileWebsiteTokenSalt)))
+	return hex.EncodeToString(sum[:])
+}
+
+func getGoFileGuestToken() (string, error) {
+	req, _ := http.NewRequest("POST", goFileAPIBase+"/accounts", nil)
+	req.Header.Set("User-Agent", ffmpegUserAgent)
+	req.Header.Set("Origin", "https://gofile.io")
+	req.Header.Set("Accept", "application/json")
+	resp, err := stHTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Status string `json:"status"`
+		Data   struct {
+			Token string `json:"token"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if out.Status != "ok" || out.Data.Token == "" {
+		return "", fmt.Errorf("gofile guest token status=%q", out.Status)
+	}
+	return out.Data.Token, nil
+}
+
+type goFileContentsResponse struct {
+	Status string `json:"status"`
+	Data   struct {
+		Children map[string]struct {
+			Type string `json:"type"`
+			Link string `json:"link"`
+			Size int64  `json:"size"`
+		} `json:"children"`
+	} `json:"data"`
+}
+
+func getGoFileContents(code, token, wt string) (*goFileContentsResponse, error) {
+	u := fmt.Sprintf("%s/contents/%s?contentFilter=&page=1&pageSize=1000&sortField=createTime&sortDirection=-1",
+		goFileAPIBase, code)
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-Website-Token", wt)
+	req.Header.Set("X-BL", goFileLang)
+	req.Header.Set("User-Agent", ffmpegUserAgent)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Origin", "https://gofile.io")
+	req.Header.Set("Referer", "https://gofile.io/d/"+code)
+	resp, err := stHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var out goFileContentsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func extractGoFileCode(rawURL string) string {
+	idx := strings.Index(rawURL, "gofile.io/d/")
+	if idx < 0 {
+		return ""
+	}
+	rest := rawURL[idx+len("gofile.io/d/"):]
+	rest = strings.Trim(rest, "/")
+	if i := strings.Index(rest, "/"); i >= 0 {
+		rest = rest[:i]
+	}
+	return rest
+}
+
+// getGoFileDirectURL returns a direct download URL (and size) for a GoFile link.
+// When GOFILE_PROXY_URL is set (the Cloudflare Worker proxy), resolution is
+// delegated to it so all GoFile API calls egress from Cloudflare — avoiding the
+// caller's IP being rate-limited / Cloudflare-blocked. Otherwise it resolves
+// directly via the public API.
+func getGoFileDirectURL(gofileURL string) (string, int64, error) {
+	code := extractGoFileCode(gofileURL)
+	if code == "" {
+		return "", 0, fmt.Errorf("cannot extract GoFile code from: %s", gofileURL)
+	}
+
+	if goFileProxyURL != "" {
+		return getGoFileDirectURLViaProxy(code)
+	}
+
+	token, err := getGoFileGuestToken()
+	if err != nil {
+		return "", 0, fmt.Errorf("gofile guest token: %w", err)
+	}
+	// Try the current website-token window, then the previous one.
+	for _, off := range []int{0, -1} {
+		wt := goFileWebsiteToken(token, off)
+		c, err := getGoFileContents(code, token, wt)
+		if err != nil {
+			continue
+		}
+		if c.Status == "ok" {
+			bestLink, bestSize := "", int64(0)
+			for _, child := range c.Data.Children {
+				if child.Type == "file" && child.Link != "" && child.Size > bestSize {
+					bestLink, bestSize = child.Link, child.Size
+				}
+			}
+			if bestLink != "" {
+				return bestLink, bestSize, nil
+			}
+		}
+	}
+	return "", 0, fmt.Errorf("no file link from GoFile for %s", code)
+}
+
+// getGoFileDirectURLViaProxy resolves through the GOFILE_PROXY_URL Cloudflare
+// Worker (?action=link), which performs the API calls server-side.
+func getGoFileDirectURLViaProxy(code string) (string, int64, error) {
+	u := fmt.Sprintf("%s?action=link&code=%s", strings.TrimRight(goFileProxyURL, "/"), code)
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("User-Agent", ffmpegUserAgent)
+	req.Header.Set("Accept", "application/json")
+	resp, err := stHTTPClient.Do(req)
+	if err != nil {
+		return "", 0, fmt.Errorf("gofile proxy request: %w", err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Status string `json:"status"`
+		Link   string `json:"link"`
+		Size   int64  `json:"size"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", 0, fmt.Errorf("gofile proxy decode: %w", err)
+	}
+	if out.Status != "ok" || out.Link == "" {
+		return "", 0, fmt.Errorf("gofile proxy status=%q", out.Status)
+	}
+	return out.Link, out.Size, nil
+}
+
+// resolveMediaSource tries each supported host (in priority order) and returns
+// the first resolvable direct CDN URL. Streamtape is preferred; GoFile is the
+// API-based fallback. The recording's embed_url is used when upload_links lacks
+// an entry for a given host.
+func resolveMediaSource(item workItem, rec database.Recording, stLogin, stKey string) (string, int64, error) {
+	// 1) Streamtape (primary)
+	stURL := item.links["Streamtape"]
+	if stURL == "" && strings.Contains(rec.EmbedURL, "streamtape") {
+		stURL = rec.EmbedURL
+	}
+	if stURL != "" {
+		if u, sz, err := getStreamtapeDirectURL(stURL, stLogin, stKey); err == nil {
+			return u, sz, nil
+		} else {
+			errorf("  Streamtape resolve failed: %v", err)
+		}
+	}
+
+	// 2) GoFile (API-based fallback, no JS required)
+	gfURL := item.links["GoFile"]
+	if gfURL == "" && strings.Contains(rec.EmbedURL, "gofile.io") {
+		gfURL = rec.EmbedURL
+	}
+	if gfURL != "" {
+		if u, sz, err := getGoFileDirectURL(gfURL); err == nil {
+			return u, sz, nil
+		} else {
+			errorf("  GoFile resolve failed: %v", err)
+		}
+	}
+
+	return "", 0, fmt.Errorf("no resolvable media source (Streamtape/GoFile) for %s", rec.Filename)
 }
 
 // ─── URL-based media generation ──────────────────────────────────────────────────────────────────
@@ -991,39 +1193,25 @@ func processOne(item workItem, seekKey, stLogin, stKey string, dryRun, thumbOnly
 		}
 	}
 
-	// ── Phase 2: URL-based generation via Streamtape CDN + FFmpeg range requests ─
-	// No full file download — FFmpeg seeks via HTTP range requests.
+	// ── Phase 2: URL-based generation via Streamtape/GoFile CDN + FFmpeg range
+	// requests. No full file download — FFmpeg seeks via HTTP range requests.
+	// Streamtape is tried first, then GoFile (API-based, no JS needed).
 	if !thumbOnly && (needThumb || needSprite || needPreview) {
-		stURL := item.links["Streamtape"]
-		// Fallback: many recordings carry their Streamtape URL in the
-		// recording's embed_url rather than in the upload_links table.
-		if stURL == "" && strings.Contains(rec.EmbedURL, "streamtape") {
-			stURL = rec.EmbedURL
+		if dryRun {
+			logf("  [dry-run] would resolve media source (Streamtape → GoFile) and run FFmpeg (no download)")
+			_ = patchDB(rec.Filename, thumb, sprite, preview, dryRun)
+			return true
 		}
-		if stURL == "" {
-			errorf("  no Streamtape link — skipping %s", rec.Filename)
+
+		logf("  🔗 resolving media source (Streamtape → GoFile)…")
+		cdnURL, fileSize, err := resolveMediaSource(item, rec, stLogin, stKey)
+		if err != nil {
+			errorf("  no media source — skipping %s: %v", rec.Filename, err)
 			atomic.AddInt64(&cntFailed, 1)
 			if thumb != rec.ThumbnailURL {
 				_ = patchDB(rec.Filename, thumb, sprite, preview, dryRun)
 			}
 			return false
-		}
-
-		if dryRun {
-			logf("  [dry-run] would fetch Streamtape CDN URL and run FFmpeg (no download)")
-			_ = patchDB(rec.Filename, thumb, sprite, preview, dryRun)
-			return true
-		}
-
-		logf("  🔗 getting Streamtape CDN URL (no download)…")
-		cdnURL, fileSize, err := getStreamtapeDirectURL(stURL, stLogin, stKey)
-		if err != nil {
-			errorf("  CDN URL failed: %v", err)
-			atomic.AddInt64(&cntFailed, 1)
-			if thumb != rec.ThumbnailURL {
-				_ = patchDB(rec.Filename, thumb, sprite, preview, dryRun)
-			}
-			return true // tried Streamtape, count as tried
 		}
 		if fileSize > 0 {
 			logf("  ✓ CDN URL acquired (size: %.1f MB) — generating via FFmpeg HTTP range requests…", float64(fileSize)/1024/1024)
@@ -1123,6 +1311,10 @@ func main() {
 	ffmpegPath := os.Getenv("FFMPEG_PATH")
 	stLogin := os.Getenv("STREAMTAPE_LOGIN")
 	stKey := os.Getenv("STREAMTAPE_API_KEY")
+	goFileProxyURL = strings.TrimSpace(os.Getenv("GOFILE_PROXY_URL"))
+	if goFileProxyURL != "" {
+		log.Printf("GoFile resolution will use proxy: %s", goFileProxyURL)
+	}
 
 	if supabaseURL == "" || supabaseKey == "" {
 		log.Fatal("SUPABASE_URL and SUPABASE_API_KEY (or SUPABASE_SERVICE_ROLE_KEY) must be set")

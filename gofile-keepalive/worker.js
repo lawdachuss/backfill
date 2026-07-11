@@ -35,6 +35,16 @@ async function fetchContents(code, token, wt) {
   return resp.json();
 }
 
+async function getGuestToken() {
+  const resp = await fetch(`${API_BASE}/accounts`, {
+    method: 'POST',
+    headers: { 'User-Agent': UA, 'Origin': 'https://gofile.io', 'Accept': 'application/json' },
+  });
+  const body = await resp.json();
+  if (body.status === 'ok' && body.data?.token) return body.data.token;
+  return null;
+}
+
 async function getFileData(code, token) {
   for (const offset of [0, -1]) {
     const wt = await websiteToken(token, offset);
@@ -43,6 +53,22 @@ async function getFileData(code, token) {
     if (body.status !== 'error-notPremium') return body;
   }
   return { status: 'error-notPremium' };
+}
+
+// Resolve the best direct download link for a file via Cloudflare egress.
+async function getDirectLink(code, token) {
+  const body = await getFileData(code, token);
+  if (body.status !== 'ok') return { status: body.status };
+  const children = body.data?.children;
+  if (!children || typeof children !== 'object') return { status: 'nochildren' };
+  let best = null;
+  for (const child of Object.values(children)) {
+    if (child.type === 'file' && child.link && (!best || (child.size || 0) > (best.size || 0))) {
+      best = child;
+    }
+  }
+  if (!best) return { status: 'nofile' };
+  return { status: 'ok', link: best.link, size: best.size || 0 };
 }
 
 async function downloadViaCdn(children, code) {
@@ -70,15 +96,26 @@ export default {
 
     // Token endpoint: return a fresh guest token
     if (action === 'token') {
-      const resp = await fetch(`${API_BASE}/accounts`, {
-        method: 'POST',
-        headers: { 'User-Agent': UA, 'Origin': 'https://gofile.io', 'Accept': 'application/json' },
-      });
-      const body = await resp.json();
-      if (body.status === 'ok' && body.data?.token) {
-        return new Response(body.data.token, { status: 200 });
-      }
+      const token = await getGuestToken();
+      if (token) return new Response(token, { status: 200 });
       return new Response('no-token', { status: 502 });
+    }
+
+    // Link endpoint: resolve the direct download URL via Cloudflare egress and
+    // return it as JSON { status, link, size }. Used by the backfill worker so
+    // API calls are routed through this proxy (avoids IP rate-limits / Cloudflare
+    // blocks on the caller's egress).
+    if (action === 'link') {
+      if (!code) return new Response('missing code param', { status: 400 });
+      const provided = url.searchParams.get('token');
+      const token = provided || (await getGuestToken());
+      if (!token) return new Response(JSON.stringify({ status: 'no-token' }), {
+        status: 502, headers: { 'Content-Type': 'application/json' },
+      });
+      const result = await getDirectLink(code, token);
+      return new Response(JSON.stringify(result), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
     }
 
     if (!code) return new Response('missing code param', { status: 400 });
@@ -86,13 +123,8 @@ export default {
     // Use provided token, or create one
     let token = url.searchParams.get('token');
     if (!token) {
-      const resp = await fetch(`${API_BASE}/accounts`, {
-        method: 'POST',
-        headers: { 'User-Agent': UA, 'Origin': 'https://gofile.io', 'Accept': 'application/json' },
-      });
-      const body = await resp.json();
-      if (body.status !== 'ok' || !body.data?.token) return new Response('no-token', { status: 502 });
-      token = body.data.token;
+      token = await getGuestToken();
+      if (!token) return new Response('no-token', { status: 502 });
     }
 
     const body = await getFileData(code, token);
