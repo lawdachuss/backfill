@@ -34,6 +34,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -794,6 +795,57 @@ func urlHasVideoStream(videoURL string) bool {
 
 // generateMediaFromURL generates thumbnail, sprite, and preview for a video
 // reachable at cdnURL using FFmpeg HTTP range requests. No full download.
+// proxiedMediaURL rewrites a media CDN URL to be fetched through the Cloudflare
+// Worker proxy (GOFILE_PROXY_URL) when configured. The Worker's `stream` action
+// forwards Range requests and egresses from Cloudflare's IPs, which the CDNs
+// accept — sidestepping the -138 "Connection failed" errors ffmpeg hits when the
+// CDN (GoFile's tapecontent.net, Streamtape, …) blocks the runner's datacenter IP.
+func proxiedMediaURL(cdnURL string) string {
+	if goFileProxyURL == "" {
+		return cdnURL
+	}
+	base := strings.TrimRight(goFileProxyURL, "/")
+	sep := "?"
+	if strings.Contains(base, "?") {
+		sep = "&"
+	}
+	return fmt.Sprintf("%s%saction=stream&u=%s", base, sep, url.QueryEscape(cdnURL))
+}
+
+// mediaURLCandidates returns the ordered list of input URLs to try for a CDN
+// URL: the direct URL first, then the Cloudflare-Worker-proxied URL (when
+// GOFILE_PROXY_URL is configured). Direct-first preserves the existing behaviour
+// for hosts that accept the runner's egress IP; the proxy is only used as a
+// fallback when the direct connection is blocked (the -138 case), so we never
+// regress a host that already works directly.
+func mediaURLCandidates(cdnURL string) []string {
+	if goFileProxyURL == "" {
+		return []string{cdnURL}
+	}
+	return []string{cdnURL, proxiedMediaURL(cdnURL)}
+}
+
+// genWithFallback runs a generator over the candidate URLs in order, stopping at
+// the first success. On a connection-level failure (CDN host unreachable / IP
+// blocked) it advances to the next candidate (e.g. direct → Worker proxy); on
+// any other failure it returns immediately since a different egress cannot help.
+func genWithFallback(candidates []string, gen func(string) (string, error)) (string, error) {
+	var lastErr error
+	for i, u := range candidates {
+		out, err := gen(u)
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
+		if isConnFailure(err) && i < len(candidates)-1 {
+			errorf("  connection blocked on egress %d, falling back to next…", i+1)
+			continue
+		}
+		return "", err
+	}
+	return "", lastErr
+}
+
 func generateMediaFromURL(cdnURL, filename string, fileSize int64, needThumb, needSprite, needPreview bool) (thumbURL, spriteURL, previewURL string) {
 	tmpDir, err := os.MkdirTemp("", "backfill-url-*")
 	if err != nil {
@@ -802,9 +854,14 @@ func generateMediaFromURL(cdnURL, filename string, fileSize int64, needThumb, ne
 	}
 	defer os.RemoveAll(tmpDir)
 
+	// Candidate egresses: direct first, then the Worker proxy as a fallback for
+	// CDNs that block the runner's IP (the -138 case). Probing runs against the
+	// direct URL; generators fall back to the proxy automatically on conn failure.
+	candidates := mediaURLCandidates(cdnURL)
+
 	logf("  🔍 probing duration + streams via ffprobe…")
-	hasVideo := urlHasVideoStream(cdnURL)
-	dur := ffprobeURLDuration(cdnURL)
+	hasVideo := urlHasVideoStream(candidates[0])
+	dur := ffprobeURLDuration(candidates[0])
 	if !hasVideo {
 		// Audio-only file (no video stream) — thumb/sprite/preview cannot be
 		// generated. Bail out early rather than letting ffmpeg fail with
@@ -833,7 +890,9 @@ func generateMediaFromURL(cdnURL, filename string, fileSize int64, needThumb, ne
 
 	if needThumb {
 		go func() {
-			url, err := urlGenThumbnail(cdnURL, dur, tmpDir, filename)
+			url, err := genWithFallback(candidates, func(u string) (string, error) {
+				return urlGenThumbnail(u, dur, tmpDir, filename)
+			})
 			if err != nil {
 				errorf("  thumbnail URL gen failed: %v", err)
 			}
@@ -845,7 +904,9 @@ func generateMediaFromURL(cdnURL, filename string, fileSize int64, needThumb, ne
 
 	if needSprite {
 		go func() {
-			url, err := urlGenSprite(cdnURL, dur, tmpDir, filename)
+			url, err := genWithFallback(candidates, func(u string) (string, error) {
+				return urlGenSprite(u, dur, tmpDir, filename)
+			})
 			if err != nil {
 				errorf("  sprite URL gen failed: %v", err)
 			}
@@ -857,7 +918,9 @@ func generateMediaFromURL(cdnURL, filename string, fileSize int64, needThumb, ne
 
 	if needPreview {
 		go func() {
-			url, err := urlGenPreview(cdnURL, dur, tmpDir, filename)
+			url, err := genWithFallback(candidates, func(u string) (string, error) {
+				return urlGenPreview(u, dur, tmpDir, filename)
+			})
 			if err != nil {
 				errorf("  preview URL gen failed: %v", err)
 			}
@@ -969,6 +1032,12 @@ func urlGenSprite(cdnURL string, dur float64, tmpDir, filename string) (string, 
 					break
 				}
 				frameErr = fmt.Errorf("frame file not written (0 bytes or missing)")
+			}
+			// A low-level TCP connect failure (CDN host unreachable / IP blocked)
+			// won't be fixed by retrying the same egress — let the caller fall
+			// back to the next candidate (Worker proxy) instead.
+			if isConnFailure(e) {
+				break
 			}
 			if attempt < 2 {
 				backoff := time.Duration(2<<uint(attempt)) * time.Second

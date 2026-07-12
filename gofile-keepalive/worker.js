@@ -118,6 +118,75 @@ export default {
       });
     }
 
+    // Stream endpoint: proxy an arbitrary media URL through Cloudflare egress
+    // with full Range support. The backfill worker uses this to fetch bytes
+    // from CDNs (GoFile's tapecontent.net, Streamtape, …) that block the
+    // caller's direct (datacenter) egress IP. Cloudflare's egress IPs are
+    // accepted by these hosts (see downloadViaCdn), so this sidesteps the
+    // -138 "Connection failed" errors ffmpeg hits when run from CI runners.
+    //   ?action=stream&u=<url-encoded target media URL>[&ref=<referer>]
+    if (action === 'stream') {
+      const target = url.searchParams.get('u');
+      if (!target) return new Response('missing u param', { status: 400 });
+      let targetURL;
+      try {
+        targetURL = new URL(target);
+      } catch {
+        return new Response('invalid u param', { status: 400 });
+      }
+      if (targetURL.protocol !== 'http:' && targetURL.protocol !== 'https:') {
+        return new Response('unsupported protocol', { status: 400 });
+      }
+      // SSRF guard: only proxy known media CDN hosts. Without this the worker
+      // would be an open proxy usable to reach internal/cloud metadata endpoints
+      // from Cloudflare's egress. Extend the list when new CDNs are added.
+      const host = targetURL.hostname.toLowerCase();
+      const ALLOWED_HOSTS = [
+        'tapecontent.net', 'gofile.io',
+        'streamtape.com', 'streamtape.net',
+      ];
+      const allowed = ALLOWED_HOSTS.some(h => host === h || host.endsWith('.' + h));
+      if (!allowed) {
+        return new Response('host not allowed: ' + host, { status: 403 });
+      }
+      // GoFile's CDN (tapecontent.net) requires a gofile.io Referer, just like
+      // the resolution path (downloadViaCdn) sets. Default to the target origin
+      // for everything else (e.g. Streamtape).
+      const ref = url.searchParams.get('ref') ||
+        (host.includes('gofile') || host.includes('tapecontent')
+          ? 'https://gofile.io/'
+          : targetURL.origin);
+      const reqHeaders = {
+        'User-Agent': UA,
+        'Referer': ref,
+        'Origin': targetURL.origin,
+        'Accept': '*/*',
+      };
+      const range = request.headers.get('Range');
+      if (range) reqHeaders['Range'] = range;
+      try {
+        const upstream = await fetch(targetURL.toString(), {
+          headers: reqHeaders,
+          signal: AbortSignal.timeout(300000),
+        });
+        // Forward the upstream response verbatim (status + headers + body).
+        // This preserves 206/Content-Range so ffmpeg's HTTP range seeks work.
+        // Strip hop-by-hop headers that must not be re-sent to the client.
+        // (content-encoding / transfer-encoding are intentionally kept so the
+        // client can still decode the streamed body correctly.)
+        const respHeaders = new Headers(upstream.headers);
+        for (const hop of ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization']) {
+          respHeaders.delete(hop);
+        }
+        return new Response(upstream.body, {
+          status: upstream.status,
+          headers: respHeaders,
+        });
+      } catch (e) {
+        return new Response('stream upstream error: ' + (e && e.message ? e.message : e), { status: 502 });
+      }
+    }
+
     if (!code) return new Response('missing code param', { status: 400 });
 
     // Use provided token, or create one
