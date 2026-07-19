@@ -211,8 +211,12 @@ func getStreamtapeDirectURL(stEmbedURL, stLogin, stKey string) (string, int64, e
 			return directURL, fileSize, nil
 		}
 		if statusVal == 403 || statusVal == 429 || strings.Contains(msg, "wait") {
-			logf("  streamtape: dl URL rate-limited (%s), waiting 4s (attempt %d/6)…", msg, attempt)
-			time.Sleep(4 * time.Second)
+			// Streamtape API explicitly says "You need to wait 4 more seconds"
+			// — respect that as a minimum. Exponential backoff on top gives
+			// 4s, 6s, 10s, 18s, 34s, 66s across 6 attempts.
+			waitSec := 4*time.Second + time.Duration(1<<uint(attempt))*time.Second
+			logf("  streamtape: dl URL rate-limited (%s), waiting %ds (attempt %d/6)…", msg, int(waitSec.Seconds()), attempt)
+			time.Sleep(waitSec)
 			continue
 		}
 		return "", 0, fmt.Errorf("no direct URL from Streamtape: %v", dlData)
@@ -357,29 +361,65 @@ func getGoFileDirectURL(gofileURL string) (string, int64, error) {
 }
 
 // getGoFileDirectURLViaProxy resolves through the GOFILE_PROXY_URL Cloudflare
-// Worker (?action=link), which performs the API calls server-side.
+// Worker (?action=link), which performs the API calls server-side. Transient
+// gateway errors from the Worker (HTTP 429/5xx — including Cloudflare 520-524)
+// are retried with exponential backoff before giving up.
 func getGoFileDirectURLViaProxy(code string) (string, int64, error) {
 	u := fmt.Sprintf("%s?action=link&code=%s", strings.TrimRight(goFileProxyURL, "/"), code)
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		link, size, retryable, err := gofileProxyOnce(u)
+		if err == nil {
+			return link, size, nil
+		}
+		lastErr = err
+		if !retryable || attempt == maxAttempts-1 {
+			return "", 0, err
+		}
+		backoff := time.Duration(2<<uint(attempt)) * time.Second
+		errorf("  GoFile proxy transient error (attempt %d/%d), retrying in %v: %v", attempt+1, maxAttempts, backoff, err)
+		time.Sleep(backoff)
+	}
+	return "", 0, lastErr
+}
+
+// gofileProxyOnce performs a single GoFile Worker-proxy resolution. The bool
+// return reports whether the error is transient (worth retrying).
+func gofileProxyOnce(u string) (link string, size int64, retryable bool, err error) {
 	req, _ := http.NewRequest("GET", u, nil)
 	req.Header.Set("User-Agent", ffmpegUserAgent)
 	req.Header.Set("Accept", "application/json")
 	resp, err := stHTTPClient.Do(req)
 	if err != nil {
-		return "", 0, fmt.Errorf("gofile proxy request: %w", err)
+		// Network-level errors are transient.
+		return "", 0, true, fmt.Errorf("gofile proxy request: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// Gateway/timeout errors from the Worker (429 or any 5xx, notably
+	// Cloudflare 520-524) are transient — the origin GoFile API is flapping.
+	if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return "", 0, true, fmt.Errorf("gofile proxy HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return "", 0, false, fmt.Errorf("gofile proxy HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
 	var out struct {
 		Status string `json:"status"`
 		Link   string `json:"link"`
 		Size   int64  `json:"size"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", 0, fmt.Errorf("gofile proxy decode: %w", err)
+		return "", 0, true, fmt.Errorf("gofile proxy decode: %w", err)
 	}
 	if out.Status != "ok" || out.Link == "" {
-		return "", 0, fmt.Errorf("gofile proxy status=%q", out.Status)
+		return "", 0, false, fmt.Errorf("gofile proxy status=%q", out.Status)
 	}
-	return out.Link, out.Size, nil
+	return out.Link, out.Size, false, nil
 }
 
 // resolveMediaSource tries each supported host (in priority order) and returns
@@ -620,16 +660,40 @@ func buildProxyPool() *proxyPool {
 // isConnFailure reports whether an ffmpeg/ffprobe error is a low-level TCP
 // connect failure (CDN host unreachable / IP blocked) rather than a transient
 // decode error. These are not worth retrying against a blocked runner IP.
+//
+// It also matches upstream 5xx gateway errors surfaced by the Cloudflare Worker
+// proxy (HTTP 520-524, notably 522 "connection timed out" and 520/521/523/524).
+// When the proxy itself can't reach the origin CDN, retrying the same proxy
+// egress won't help — treat it like a connection failure so the caller advances
+// to the next egress candidate (or skips) instead of burning retries.
 func isConnFailure(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "Error number -138") ||
+	if strings.Contains(msg, "Error number -138") ||
 		strings.Contains(msg, "Connection to tcp") ||
 		strings.Contains(msg, "Connection failed") ||
 		strings.Contains(msg, "Could not connect") ||
-		strings.Contains(msg, "Network is unreachable")
+		strings.Contains(msg, "Network is unreachable") {
+		return true
+	}
+	// Cloudflare Worker proxy gateway errors (origin CDN unreachable/timeout).
+	// ffmpeg surfaces these as e.g. "HTTP error 522" or
+	// "Server returned 5XX Server Error reply".
+	if strings.Contains(msg, "Server returned 5XX") {
+		return true
+	}
+	for _, code := range []string{
+		"HTTP error 520", "HTTP error 521", "HTTP error 522",
+		"HTTP error 523", "HTTP error 524", "HTTP error 502",
+		"HTTP error 503", "HTTP error 504",
+	} {
+		if strings.Contains(msg, code) {
+			return true
+		}
+	}
+	return false
 }
 
 // ffprobeBin returns the ffprobe binary path derived from ffmpegBin.
@@ -689,7 +753,15 @@ func runAVTool(ctx context.Context, bin string, args []string) ([]byte, error) {
 			// Non-connection error (decode/format) — proxy won't help.
 			return nil, lastErr
 		}
-		errorf("  CDN connection blocked via proxy %s, rotating (%d/%d)…", maskProxy(proxy), i+1, maxTries)
+		// Add backoff between proxy rotations so we don't burn through all
+		// candidates too fast when the CDN is flapping.
+		if i > 0 {
+			backoff := time.Duration(1<<uint(i-1)) * time.Second
+			errorf("  CDN connection blocked via proxy %s, backoff %v, rotating (%d/%d)…", maskProxy(proxy), backoff, i+1, maxTries)
+			time.Sleep(backoff)
+		} else {
+			errorf("  CDN connection blocked via proxy %s, rotating (%d/%d)…", maskProxy(proxy), i+1, maxTries)
+		}
 		proxyPoolInstance.next()
 	}
 	return nil, lastErr
@@ -838,7 +910,11 @@ func genWithFallback(candidates []string, gen func(string) (string, error)) (str
 		}
 		lastErr = err
 		if isConnFailure(err) && i < len(candidates)-1 {
-			errorf("  connection blocked on egress %d, falling back to next…", i+1)
+			// Brief pause before trying the fallback egress so CDNs that
+			// temporarily blacklist the current IP have time to cool down.
+			backoff := time.Duration(1<<uint(i)) * time.Second
+			errorf("  connection blocked on egress %d, backoff %v, falling back to next…", i+1, backoff)
+			time.Sleep(backoff)
 			continue
 		}
 		return "", err

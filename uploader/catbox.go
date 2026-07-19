@@ -217,11 +217,22 @@ func isRetryableCatboxError(err error) bool {
 		return true
 	}
 
+	// Empty response — Catbox returned HTTP 200 with no body. This is a
+	// transient Catbox-side issue (server is flapping). Retry with backoff.
+	if strings.Contains(errStr, "empty response") {
+		return true
+	}
+
 	if strings.Contains(errStr, "stat file") || strings.Contains(errStr, "open file") {
 		return true
 	}
 
 	if strings.Contains(errStr, "send request") || strings.Contains(errStr, "read response") {
+		return true
+	}
+
+	// Timeout errors are retryable (Catbox may be overloaded).
+	if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "Timeout") {
 		return true
 	}
 

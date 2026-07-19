@@ -140,14 +140,43 @@ def save_progress(codes: list, index: int, errors: list, state: str = "running")
         }, f)
 
 
-def query_supabase(path: str) -> list:
+def query_supabase(path: str, max_attempts: int = 5) -> list:
+    """Query the Supabase REST API, retrying transient gateway/timeout errors
+    (HTTP 408/429/5xx — notably Cloudflare 520-524 in front of Supabase) with
+    exponential backoff. Raises on the final attempt so callers still fail loud
+    if the DB is genuinely unreachable."""
+    if not SUPABASE_URL or not SUPABASE_API_KEY:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_API_KEY must be set")
     url = f"{SUPABASE_URL}/rest/v1{path}"
-    req = urllib.request.Request(url)
-    req.add_header("apikey", SUPABASE_API_KEY)
-    req.add_header("Authorization", f"Bearer {SUPABASE_API_KEY}")
-    req.add_header("Accept", "application/json")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode())
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        req = urllib.request.Request(url)
+        req.add_header("apikey", SUPABASE_API_KEY)
+        req.add_header("Authorization", f"Bearer {SUPABASE_API_KEY}")
+        req.add_header("Accept", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            last_err = e
+            transient = e.code in (408, 429) or 500 <= e.code <= 599
+            if not transient or attempt == max_attempts:
+                raise
+            wait = min(2 ** attempt, 30)
+            log(f"[gofile-keepalive] Supabase HTTP {e.code} (attempt "
+                f"{attempt}/{max_attempts}), retrying in {wait}s…")
+            time.sleep(wait)
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = e
+            if attempt == max_attempts:
+                raise
+            wait = min(2 ** attempt, 30)
+            log(f"[gofile-keepalive] Supabase request failed ({e}) (attempt "
+                f"{attempt}/{max_attempts}), retrying in {wait}s…")
+            time.sleep(wait)
+    if last_err:
+        raise last_err
+    return []
 
 
 def get_all_gofile_links() -> list[str]:
@@ -354,7 +383,16 @@ def run():
                 errors.append({"code": code, "error": "token expired"})
                 break
             elif status == 0:
-                log(f"[gofile-keepalive]   {i+1}/{total}: {code} conn fail: {body}")
+                # Connection reset / timeout / network error — retry with
+                # exponential backoff instead of failing immediately. These
+                # are often transient (GoFile CDN flapping, proxy pool
+                # rotating). Only give up after exhausting all retries.
+                if attempt < 2:
+                    wait = (attempt + 1) * 5
+                    log(f"[gofile-keepalive]   {i+1}/{total}: {code} conn fail: {body} — retry {attempt+1}/3 in {wait}s")
+                    time.sleep(wait)
+                    continue
+                log(f"[gofile-keepalive]   {i+1}/{total}: {code} conn fail after retries: {body}")
                 errors.append({"code": code, "error": f"conn {body}"})
                 break
             else:
