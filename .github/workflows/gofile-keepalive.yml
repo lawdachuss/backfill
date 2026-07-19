@@ -31,6 +31,17 @@ jobs:
           path: gofile-keepalive/.progress
           key: gofile-keepalive-progress-v1
 
+      # Deploy the proxy Worker FIRST — before running keepalive — so that
+      # the Worker (GOFILE_PROXY_URL) is live when keepalive tries to use
+      # it for token fetching and page visits. Only runs when a Cloudflare
+      # API token with Workers permissions is configured.
+      - name: Deploy proxy Worker
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+        working-directory: gofile-keepalive
+        run: |
+          npm install -g wrangler
+          wrangler deploy
+
       - name: Run keepalive
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -38,16 +49,6 @@ jobs:
           GOFILE_PROXY_URL: ${{ secrets.GOFILE_PROXY_URL }}
           PROXY_SOURCE: ${{ secrets.PROXY_SOURCE }}
         run: python gofile-keepalive/keepalive.py
-
-      # Deploy the proxy Worker so the `stream` action (which backfill routes
-      # ffmpeg/ffprobe media downloads through) is live. Only runs when a
-      # Cloudflare API token with Workers permissions is configured.
-      - name: Deploy proxy Worker
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
-        working-directory: gofile-keepalive
-        run: |
-          npm install -g wrangler
-          wrangler deploy
 
   retrigger:
     needs: keepalive
