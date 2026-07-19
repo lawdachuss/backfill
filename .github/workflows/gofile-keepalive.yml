@@ -38,8 +38,10 @@ jobs:
       - name: Deploy proxy Worker
         if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
         working-directory: gofile-keepalive
+        # Pin wrangler to v3 — v4+ changed deploy behaviour and requires
+        # static asset config even for Workers-only projects.
         run: |
-          npm install -g wrangler
+          npm install -g wrangler@3
           wrangler deploy
 
       - name: Run keepalive
