@@ -16,9 +16,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/teacat/chaturbate-dvr/channel"
 	"github.com/teacat/chaturbate-dvr/entity"
 	"github.com/teacat/chaturbate-dvr/server"
+	"github.com/teacat/chaturbate-dvr/uploader"
 )
 
 // ─── flags (added for pagination + sharding) ────────────────────────────────
@@ -250,6 +250,51 @@ func checkFFmpeg() {
 	log.Println("ffmpeg/ffprobe found")
 }
 
+// ── Local thumbnail generation (replaces missing channel package) ───────────
+//
+// generateThumbnailFromVideo extracts a single frame via ffmpeg and uploads it
+// to Pixhost.to via the existing ThumbnailUploader.  Returns the public URL.
+// If the video is too short (< 3s) it grabs the first frame instead.
+
+func generateThumbnailFromVideo(videoPath string) (string, error) {
+	workDir := filepath.Dir(videoPath)
+	stem := strings.TrimSuffix(filepath.Base(videoPath), filepath.Ext(videoPath))
+	thumbJpg := filepath.Join(workDir, stem+"_thumb.jpg")
+
+	// Probe duration to pick a sane seek point
+	durStr := "10"
+	if b, err := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration",
+		"-of", "csv=p=0", videoPath).Output(); err == nil {
+		durStr = strings.TrimSpace(string(b))
+	}
+
+	var seekSec string
+	if f, e := fmt.Sscanf(durStr, "%f", &f); e == nil && f > 3 {
+		seekSec = fmt.Sprintf("%.0f", f/3) // seek to 1/3 into the video
+	} else {
+		seekSec = "1"
+	}
+
+	log.Printf("  extracting thumbnail frame at %ss (duration=%ss)", seekSec, durStr)
+	cmd := exec.Command("ffmpeg", "-y", "-ss", seekSec, "-i", videoPath,
+		"-vframes", "1", "-q:v", "3", thumbJpg)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("ffmpeg thumbnail: %w", err)
+	}
+
+	defer os.Remove(thumbJpg)
+
+	log.Printf("  uploading thumbnail to Pixhost.to...")
+	thumbUploader := uploader.NewThumbnailUploader("")
+	url, err := thumbUploader.Upload(thumbJpg)
+	if err != nil {
+		return "", fmt.Errorf("Pixhost upload: %w", err)
+	}
+	log.Printf("  thumbnail uploaded: %s", url)
+	return url, nil
+}
+
 func main() {
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lshortfile)
@@ -413,26 +458,24 @@ func main() {
 			continue
 		}
 
-		log.Printf("  generating thumbnails for %s...", localPath)
-		thumbURL, spriteURL, previewURL := channel.GenerateThumbnailForFile(localPath)
-
-		if thumbURL == "" && spriteURL == "" && previewURL == "" {
-			log.Printf("  WARN: thumbnail generation returned empty URLs")
+		log.Printf("  generating thumbnail for %s...", localPath)
+		thumbURL, err := generateThumbnailFromVideo(localPath)
+		if err != nil {
+			log.Printf("  WARN: thumbnail generation failed: %v", err)
 			os.Remove(localPath)
 			continue
 		}
-		log.Printf("  thumb: %s", thumbURL)
-		log.Printf("  sprite: %s", spriteURL)
-		log.Printf("  preview: %s", previewURL)
 
-		log.Printf("  saving to preview_images table...")
-		if err := server.SavePreviewLinks(r.Filename, thumbURL, spriteURL, previewURL); err != nil {
-			log.Printf("  WARN: SavePreviewLinks failed: %v", err)
+		log.Printf("  thumbnail URL: %s", thumbURL)
+
+		log.Printf("  updating recordings table with thumbnail...")
+		if err := server.UpdateRecordingThumbnails(r.Filename, thumbURL, "", ""); err != nil {
+			log.Printf("  WARN: UpdateRecordingThumbnails failed: %v", err)
 		}
 
-		log.Printf("  updating recordings table...")
-		if err := server.UpdateRecordingThumbnails(r.Filename, thumbURL, spriteURL, previewURL); err != nil {
-			log.Printf("  WARN: UpdateRecordingThumbnails failed: %v", err)
+		log.Printf("  saving to preview_images table...")
+		if err := server.SavePreviewLinks(r.Filename, thumbURL, "", ""); err != nil {
+			log.Printf("  WARN: SavePreviewLinks failed: %v", err)
 		}
 
 		os.Remove(localPath)
