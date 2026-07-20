@@ -45,26 +45,8 @@ jobs:
         with:
           go-version: stable
 
-      # Install ffmpeg + yt-dlp for local thumbnail/preview generation
-      - name: Install ffmpeg and yt-dlp
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
-          pip install --quiet yt-dlp
-          ffmpeg -version | head -1
-          yt-dlp --version
-
-      # Step 1: Try host-manage API backfill (SeekStreaming / UPnShare)
       - name: Run host backfill shard ${{ matrix.shard }}
-        continue-on-error: true
         run: go run scripts/backfill_media.go -duration 5h -delay 30s -concurrency 1 -shard ${{ matrix.shard }} -shards 4
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # Step 2: Generate thumbnails/previews locally for ALL remaining recordings
-      # Downloads via yt-dlp from any host, generates with ffmpeg, uploads to Pixhost
-      - name: Run local preview generation shard ${{ matrix.shard }}
-        run: go run scripts/generate_previews.go -shard ${{ matrix.shard }} -shards 4
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
