@@ -49,77 +49,79 @@ func ExtractUPnShareVideoID(embedURL string) string {
 
 // GetUPnShareMediaURLs fetches the poster and preview URLs for a UPnShare video.
 //
-// The embed URL stores UPnShare's *player* ID, which is NOT the same as the
-// manage-API video id, so a direct by-ID lookup 404s. The reliable way to find
-// the video is to search the manage list by the recording's username and then
-// pick the entry whose name contains this recording's exact timestamp token
-// (the unique YYYY-MM-DD_HH-MM-SS portion). We fall back to a prefix/ID match
-// only if the token isn't present.
-func GetUPnShareMediaURLs(apiKey, videoID, filename string) (posterURL, previewURL string, err error) {
-	fetchByID := func() (*upnshareManageVideo, error) {
-		if videoID == "" {
-			return nil, fmt.Errorf("empty video ID")
-		}
-		req, e := http.NewRequest("GET", fmt.Sprintf("https://upnshare.com/api/v1/video/manage/%s", videoID), nil)
-		if e != nil {
-			return nil, fmt.Errorf("create request: %w", e)
-		}
-		req.Header.Set("api-token", apiKey)
-		req.Header.Set("User-Agent", defaultUserAgent)
-
-		resp, e := mediaFetchClient.Do(req)
-		if e != nil {
-			return nil, fmt.Errorf("request: %w", e)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("status %d", resp.StatusCode)
-		}
-		var detail upnshareManageVideo
-		if e := json.NewDecoder(resp.Body).Decode(&detail); e != nil {
-			return nil, fmt.Errorf("decode: %w", e)
-		}
-		if detail.ID == "" {
-			return nil, fmt.Errorf("empty response")
-		}
-		return &detail, nil
+// The recorder rotates through multiple API keys on upload, so a given video may
+// live under ANY of the configured keys. We therefore try every key until one
+// returns a match. The reliable lookup is a manage-list search by the recording's
+// full filename (UPnShare indexes videos by original filename), matched on exact
+// name — the same path the recorder uses.
+func GetUPnShareMediaURLs(apiKeys []string, videoID, filename string) (posterURL, previewURL string, err error) {
+	if len(apiKeys) == 0 {
+		return "", "", fmt.Errorf("UPnShare key not configured")
 	}
 
-	// The by-ID endpoint occasionally works (e.g. when the player ID happens to
-	// equal the manage id). Try it, but don't fail if it 404s.
-	if detail, e := fetchByID(); e == nil {
-		p, pr := buildUPnShareURLs(detail)
-		return p, pr, nil
-	}
+	// Resolve via the manage list, trying each key in turn.
+	for _, apiKey := range apiKeys {
+		if filename != "" {
+			if list, se := searchUPnShareByName(filename, apiKey); se == nil {
+				for i := range list {
+					if list[i].Name == filename {
+						p, pr := buildUPnShareURLs(&list[i])
+						return p, pr, nil
+					}
+				}
+			}
 
-	// Otherwise resolve the same way the recorder does: search the manage list
-	// by the FULL filename (UPnShare indexes videos by their original filename)
-	// and match on exact name. This is the path that works in production.
-	if filename != "" {
-		if list, se := searchUPnShareByName(filename, apiKey); se == nil {
-			for i := range list {
-				if list[i].Name == filename {
-					p, pr := buildUPnShareURLs(&list[i])
-					return p, pr, nil
+			// Fallback: search by username + timestamp-token match for recordings
+			// whose stored filename differs from the host's name.
+			user := upnshareUsername(filename)
+			token := upnshareTimestampToken(filename)
+			if user != "" {
+				if list, se := searchUPnShareByName(user, apiKey); se == nil {
+					if v := matchUPnShareVideo(list, filename, token, videoID); v != nil {
+						p, pr := buildUPnShareURLs(v)
+						return p, pr, nil
+					}
 				}
 			}
 		}
 
-		// Fallback: search by username + timestamp-token match for recordings
-		// whose stored filename differs from the host's name.
-		user := upnshareUsername(filename)
-		token := upnshareTimestampToken(filename)
-		if user != "" {
-			if list, se := searchUPnShareByName(user, apiKey); se == nil {
-				if v := matchUPnShareVideo(list, filename, token, videoID); v != nil {
-					p, pr := buildUPnShareURLs(v)
-					return p, pr, nil
-				}
+		// Last resort: by-ID lookup (works only when the player ID equals the
+		// manage id). Tried per-key since the id may be scoped to a key.
+		if videoID != "" {
+			if detail, e := fetchUPnShareByID(apiKey, videoID); e == nil {
+				p, pr := buildUPnShareURLs(detail)
+				return p, pr, nil
 			}
 		}
 	}
 
 	return "", "", fmt.Errorf("UPnShare media not available yet for %s", videoID)
+}
+
+func fetchUPnShareByID(apiKey, videoID string) (*upnshareManageVideo, error) {
+	req, e := http.NewRequest("GET", fmt.Sprintf("https://upnshare.com/api/v1/video/manage/%s", videoID), nil)
+	if e != nil {
+		return nil, fmt.Errorf("create request: %w", e)
+	}
+	req.Header.Set("api-token", apiKey)
+	req.Header.Set("User-Agent", defaultUserAgent)
+
+	resp, e := mediaFetchClient.Do(req)
+	if e != nil {
+		return nil, fmt.Errorf("request: %w", e)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var detail upnshareManageVideo
+	if e := json.NewDecoder(resp.Body).Decode(&detail); e != nil {
+		return nil, fmt.Errorf("decode: %w", e)
+	}
+	if detail.ID == "" {
+		return nil, fmt.Errorf("empty response")
+	}
+	return &detail, nil
 }
 
 // buildUPnShareURLs assembles the absolute poster/preview URLs from a manage
