@@ -35,6 +35,7 @@ jobs:
       CATBOX_USERHASH: ${{ secrets.CATBOX_USERHASH }}
       X02_API_KEY: ${{ secrets.X02_API_KEY }}
       SEEKSTREAMING_KEY: ${{ secrets.SEEKSTREAMING_KEY }}
+      UPNSHARE_KEYS: ${{ secrets.UPNSHARE_KEYS }}
       FFMPEG_PROXY: ${{ secrets.FFMPEG_PROXY }}
       GOFILE_PROXY_URL: ${{ secrets.GOFILE_PROXY_URL }}
       PROXY_SOURCE: ${{ secrets.PROXY_SOURCE }}

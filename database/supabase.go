@@ -364,6 +364,37 @@ func (c *Client) DeleteRecording(filename string) error {
 	return c.delete(fmt.Sprintf("/recordings?filename=eq.%s", url.QueryEscape(filename)))
 }
 
+// PatchRecordingMedia patches the host-sourced thumbnail and preview URLs on a
+// recording matched by filename. Used by the backfill worker (and media
+// watcher) to populate poster/preview URLs fetched from SeekStreaming/UPnShare
+// without touching any other field.
+func (c *Client) PatchRecordingMedia(filename, thumbnailURL, previewURL string) error {
+	if thumbnailURL == "" && previewURL == "" {
+		return nil
+	}
+	body := map[string]interface{}{}
+	if thumbnailURL != "" {
+		body["thumbnail_url"] = thumbnailURL
+	}
+	if previewURL != "" {
+		body["preview_url"] = previewURL
+	}
+	return c.patch(fmt.Sprintf("/recordings?filename=eq.%s", url.QueryEscape(filename)), body)
+}
+
+// GetNewestRecordings returns the most recent recordings (by timestamp,
+// descending) limited to `limit`. Used by the media-enrichment pass to focus
+// on recordings that may not yet have host-generated poster/preview URLs
+// without scanning the whole table.
+func (c *Client) GetNewestRecordings(limit int) ([]Recording, error) {
+	var recs []Recording
+	path := fmt.Sprintf("/recordings?order=timestamp.desc&limit=%d", limit)
+	if err := c.get(path, &recs); err != nil {
+		return nil, err
+	}
+	return recs, nil
+}
+
 // DeletePreviewImage removes a preview image by filename
 func (c *Client) DeletePreviewImage(filename string) error {
 	return c.delete(fmt.Sprintf("/preview_images?filename=eq.%s", url.QueryEscape(filename)))

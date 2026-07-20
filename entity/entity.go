@@ -178,6 +178,7 @@ type Config struct {
 	MixdropEmail     string
 	MixdropToken     string
 	SeekStreamingKey string
+	UpnshareKeys     []string
 
 	SupabaseURL    string
 	SupabaseAPIKey string

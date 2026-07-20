@@ -880,6 +880,24 @@ func DeleteChannelsNotInDB(usernames []string) error {
 	return client.DeleteChannelsNotIn(usernames)
 }
 
+// UpdateRecordingMediaURLs patches the host-sourced thumbnail and preview URLs
+// on a recording (matched by filename). Thumbnail and preview URLs are now
+// sourced entirely from the upload hosts (SeekStreaming / UPnShare poster +
+// preview) and stored inline on the recordings row; sprite sheets were
+// removed. Called by the backfill worker once the host has generated the
+// poster/preview for a video.
+func UpdateRecordingMediaURLs(filename, thumbnailURL, previewURL string) error {
+	client := GetDBClient()
+	if client == nil {
+		return fmt.Errorf("Supabase not configured")
+	}
+	if err := client.PatchRecordingMedia(filename, thumbnailURL, previewURL); err != nil {
+		return err
+	}
+	cacheClear()
+	return nil
+}
+
 // UpdateRecordingThumbnails patches the thumbnail_url, sprite_url and preview_url on an
 // existing recording row identified by filename.
 func UpdateRecordingThumbnails(filename, thumbnailURL, spriteURL, previewURL string) error {
