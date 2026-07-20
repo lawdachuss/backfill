@@ -153,9 +153,8 @@ func supabasePost(path string, body interface{}) error {
 	return nil
 }
 
-// ── paginated helpers (added: fetch ALL recordings/previews, not just 500) ──
+// ── paginated helpers (fetch ALL recordings/previews, not just 500) ─────────
 
-// paginatedRecordings fetches ALL recordings by paginating 1000 at a time.
 func paginatedRecordings() ([]recordingRow, error) {
 	var all []recordingRow
 	offset := 0
@@ -179,7 +178,6 @@ func paginatedRecordings() ([]recordingRow, error) {
 	return all, nil
 }
 
-// paginatedPreviews fetches ALL preview_images by paginating 1000 at a time.
 func paginatedPreviews() ([]previewRow, error) {
 	var all []previewRow
 	offset := 0
@@ -250,17 +248,15 @@ func checkFFmpeg() {
 	log.Println("ffmpeg/ffprobe found")
 }
 
-// ── Local thumbnail generation (replaces missing channel package) ───────────
-//
-// generateThumbnailFromVideo extracts a single frame via ffmpeg and uploads it
-// to Pixhost.to via the existing ThumbnailUploader.  Returns the public URL.
+// ── Local thumbnail + preview generation (replaces missing channel package) ──
 
+// generateThumbnailFromVideo extracts a single frame via ffmpeg and uploads it
+// to Pixhost.to (fallback ImgBB/Catbox). Returns the public URL.
 func generateThumbnailFromVideo(videoPath string) (string, error) {
 	workDir := filepath.Dir(videoPath)
 	stem := strings.TrimSuffix(filepath.Base(videoPath), filepath.Ext(videoPath))
 	thumbJpg := filepath.Join(workDir, stem+"_thumb.jpg")
 
-	// Probe duration to pick a sane seek point (~1/3 into the video)
 	durStr := "10"
 	if b, err := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration",
 		"-of", "csv=p=0", videoPath).Output(); err == nil {
@@ -282,16 +278,64 @@ func generateThumbnailFromVideo(videoPath string) (string, error) {
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("ffmpeg thumbnail: %w", err)
 	}
-
 	defer os.Remove(thumbJpg)
 
-	log.Printf("  uploading thumbnail to Pixhost.to...")
-	thumbUploader := uploader.NewThumbnailUploader("")
-	url, err := thumbUploader.Upload(thumbJpg)
+	log.Printf("  uploading thumbnail to image host...")
+	imgUploader := uploader.NewMultiImageUploader()
+	url, _, err := imgUploader.Upload(thumbJpg)
 	if err != nil {
-		return "", fmt.Errorf("Pixhost upload: %w", err)
+		return "", fmt.Errorf("image upload failed: %w", err)
 	}
 	log.Printf("  thumbnail uploaded: %s", url)
+	return url, nil
+}
+
+// generatePreviewFromVideo creates a short animated WebP preview clip and
+// uploads it. Returns the public URL.
+func generatePreviewFromVideo(videoPath string) (string, error) {
+	workDir := filepath.Dir(videoPath)
+	stem := strings.TrimSuffix(filepath.Base(videoPath), filepath.Ext(videoPath))
+	prevWebp := filepath.Join(workDir, stem+"_preview.webp")
+
+	durStr := "30"
+	if b, err := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration",
+		"-of", "csv=p=0", videoPath).Output(); err == nil {
+		durStr = strings.TrimSpace(string(b))
+	}
+
+	var dur float64
+	if _, err := fmt.Sscanf(durStr, "%f", &dur); err != nil || dur < 3 {
+		dur = 30
+	}
+
+	// Pick a 10-second window starting at 20% into the video
+	startSec := dur * 0.2
+	if dur < 30 {
+		startSec = dur * 0.3
+	}
+
+	log.Printf("  generating 10s animated preview at %.0fs (total=%.0fs)", startSec, dur)
+	cmd := exec.Command("ffmpeg", "-y", "-ss", fmt.Sprintf("%.0f", startSec),
+		"-i", videoPath,
+		"-t", "10",
+		"-vf", "fps=10,scale=480:-1:flags=lanczos",
+		"-loop", "0",
+		"-compression_level", "4",
+		"-q:v", "50",
+		prevWebp)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("ffmpeg preview: %w", err)
+	}
+	defer os.Remove(prevWebp)
+
+	log.Printf("  uploading preview to image host...")
+	imgUploader := uploader.NewMultiImageUploader()
+	url, _, err := imgUploader.Upload(prevWebp)
+	if err != nil {
+		return "", fmt.Errorf("preview upload failed: %w", err)
+	}
+	log.Printf("  preview uploaded: %s", url)
 	return url, nil
 }
 
@@ -382,7 +426,6 @@ func main() {
 	log.Printf("Recordings still needing preview generation: %d", len(todo))
 
 	// ── Shard the work across matrix jobs ───────────────────────────────────
-	// Each shard handles every Nth recording so load is evenly distributed.
 	if *flagShards > 1 {
 		s := *flagShard
 		if s < 0 {
@@ -399,7 +442,6 @@ func main() {
 		log.Printf("Shard %d/%d — processing %d of %d pending recordings", s, *flagShards, len(todo), len(recordings))
 	}
 
-	// ── Apply optional limit ────────────────────────────────────────────────
 	if *flagLimit > 0 && len(todo) > *flagLimit {
 		log.Printf("Limiting to %d recordings (--limit flag)", *flagLimit)
 		todo = todo[:*flagLimit]
@@ -440,8 +482,6 @@ func main() {
 		}
 
 		var localPath string
-
-		// Try yt-dlp for any host (fallback)
 		if localPath == "" {
 			for _, l := range links {
 				localPath, err = downloadWithYtDlp(l.URL, workDir, r.Filename)
@@ -452,12 +492,12 @@ func main() {
 				break
 			}
 		}
-
 		if localPath == "" {
 			log.Printf("  SKIP: could not download from any host")
 			continue
 		}
 
+		// ── Generate thumbnail frame ────────────────────────────────────────
 		log.Printf("  generating thumbnail for %s...", localPath)
 		thumbURL, err := generateThumbnailFromVideo(localPath)
 		if err != nil {
@@ -465,16 +505,27 @@ func main() {
 			os.Remove(localPath)
 			continue
 		}
-
 		log.Printf("  thumbnail URL: %s", thumbURL)
 
-		log.Printf("  updating recordings table with thumbnail...")
-		if err := server.UpdateRecordingThumbnails(r.Filename, thumbURL, "", ""); err != nil {
+		// ── Generate animated preview clip ──────────────────────────────────
+		log.Printf("  generating preview clip for %s...", localPath)
+		previewURL, err := generatePreviewFromVideo(localPath)
+		if err != nil {
+			log.Printf("  WARN: preview generation failed (thumbnail saved): %v", err)
+			previewURL = ""
+		}
+		if previewURL != "" {
+			log.Printf("  preview URL: %s", previewURL)
+		}
+
+		// ── Save both to Supabase ───────────────────────────────────────────
+		log.Printf("  updating recordings table...")
+		if err := server.UpdateRecordingThumbnails(r.Filename, thumbURL, "", previewURL); err != nil {
 			log.Printf("  WARN: UpdateRecordingThumbnails failed: %v", err)
 		}
 
 		log.Printf("  saving to preview_images table...")
-		if err := server.SavePreviewLinks(r.Filename, thumbURL, "", ""); err != nil {
+		if err := server.SavePreviewLinks(r.Filename, thumbURL, "", previewURL); err != nil {
 			log.Printf("  WARN: SavePreviewLinks failed: %v", err)
 		}
 
