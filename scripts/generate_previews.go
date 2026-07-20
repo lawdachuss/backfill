@@ -59,11 +59,6 @@ type recordingRow struct {
 	PreviewURL   string `json:"preview_url"`
 }
 
-type uploadLinkRow struct {
-	Host string `json:"host"`
-	URL  string `json:"url"`
-}
-
 type previewRow struct {
 	Filename     string `json:"filename"`
 	ThumbnailURL string `json:"thumbnail_url"`
@@ -90,64 +85,6 @@ func supabaseGet(path string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	return io.ReadAll(resp.Body)
-}
-
-func supabasePatch(path string, body []byte) error {
-	base := os.Getenv("SUPABASE_URL")
-	key := os.Getenv("SUPABASE_API_KEY")
-	if base == "" || key == "" {
-		return fmt.Errorf("Supabase not configured")
-	}
-	req, err := http.NewRequest("PATCH", base+"/rest/v1"+path, strings.NewReader(string(body)))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("apikey", key)
-	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Prefer", "return=minimal")
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
-	}
-	return nil
-}
-
-func supabasePost(path string, body interface{}) error {
-	base := os.Getenv("SUPABASE_URL")
-	key := os.Getenv("SUPABASE_API_KEY")
-	if base == "" || key == "" {
-		return fmt.Errorf("Supabase not configured")
-	}
-	data, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest("POST", base+"/rest/v1"+path, strings.NewReader(string(data)))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("apikey", key)
-	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Prefer", "resolution=merge-duplicates,return=minimal")
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
-	}
-	return nil
 }
 
 // ── paginated helpers (fetch ALL recordings/previews, not just 500) ─────────
