@@ -22,28 +22,8 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       COOKIES: ${{ secrets.COOKIES }}
       USER_AGENT: ${{ secrets.USER_AGENT }}
-      STREAMTAPE_LOGIN: ${{ secrets.STREAMTAPE_LOGIN }}
-      STREAMTAPE_API_KEY: ${{ secrets.STREAMTAPE_API_KEY }}
-      VOESX_API_KEY: ${{ secrets.VOESX_API_KEY }}
-      SENDCM_API_KEY: ${{ secrets.SENDCM_API_KEY }}
-      BYSE_API_KEY: ${{ secrets.BYSE_API_KEY }}
-      MIXDROP_EMAIL: ${{ secrets.MIXDROP_EMAIL }}
-      MIXDROP_KEY: ${{ secrets.MIXDROP_KEY }}
-      LOBFILE_API_KEY: ${{ secrets.LOBFILE_API_KEY }}
-      IMGBB_API_KEY: ${{ secrets.IMGBB_API_KEY }}
-      PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
-      CATBOX_USERHASH: ${{ secrets.CATBOX_USERHASH }}
-      X02_API_KEY: ${{ secrets.X02_API_KEY }}
       SEEKSTREAMING_KEY: ${{ secrets.SEEKSTREAMING_KEY }}
       UPNSHARE_KEYS: ${{ secrets.UPNSHARE_KEYS }}
-      FFMPEG_PROXY: ${{ secrets.FFMPEG_PROXY }}
-      GOFILE_PROXY_URL: ${{ secrets.GOFILE_PROXY_URL }}
-      PROXY_SOURCE: ${{ secrets.PROXY_SOURCE }}
-      PROXY_ALLOW_DIRECT: ${{ secrets.PROXY_ALLOW_DIRECT }}
-      FFMPEG_USER_AGENT: ${{ secrets.FFMPEG_USER_AGENT }}
-      FFMPEG_REFERER: ${{ secrets.FFMPEG_REFERER }}
-      DATABASE_PASSWORD: ${{ secrets.DATABASE_PASSWORD }}
-      SESSION_DURATION: ${{ secrets.SESSION_DURATION }}
       GITHUB_REPO: lawdachuss/backfill
       GITHUB_BRANCH: master
       GITHUB_PREVIEW_PATH: previews
@@ -55,22 +35,7 @@ jobs:
         with:
           go-version: stable
 
-      - name: Install FFmpeg
-        # Retry on transient Chocolatey failures (HTTP 503, network issues)
-        # which the community repo sometimes returns under load.
-        run: |
-          $maxRetries = 3
-          $delay = 15
-          for ($i = 0; $i -lt $maxRetries; $i++) {
-            if ($i -gt 0) { Start-Sleep -Seconds $delay; $delay *= 2 }
-            choco install ffmpeg -y --no-progress
-            if ($LASTEXITCODE -eq 0) { exit 0 }
-            Write-Warning "choco install ffmpeg failed (attempt $($i+1)/$maxRetries), retrying in ${delay}s..."
-          }
-          exit 1
-
       - name: Run backfill (5h max, 2min delay between recordings)
         run: go run scripts/backfill_media.go -duration 5h -delay 2m -concurrency 1 -trigger-workflow
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FFMPEG_PATH: ffmpeg
