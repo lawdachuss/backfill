@@ -124,7 +124,7 @@ func fetchHostMedia(seekKey string, upnKeys []string, host, videoID, filename st
 		if seekKey == "" {
 			return "", "", fmt.Errorf("SeekStreaming key not configured")
 		}
-		return uploader.GetSeekStreamingMediaURLs(seekKey, videoID)
+		return uploader.GetSeekStreamingMediaURLs(seekKey, videoID, filename)
 	case "upnshare":
 		if len(upnKeys) == 0 {
 			return "", "", fmt.Errorf("UPnShare key not configured")

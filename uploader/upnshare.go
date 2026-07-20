@@ -85,21 +85,36 @@ func GetUPnShareMediaURLs(apiKey, videoID, filename string) (posterURL, previewU
 		return &detail, nil
 	}
 
-	// Fast path: the by-ID endpoint occasionally works (e.g. when the player ID
-	// happens to equal the manage id).
+	// The by-ID endpoint occasionally works (e.g. when the player ID happens to
+	// equal the manage id). Try it, but don't fail if it 404s.
 	if detail, e := fetchByID(); e == nil {
 		p, pr := buildUPnShareURLs(detail)
 		return p, pr, nil
 	}
 
-	// Otherwise resolve via the username search + timestamp-token match.
+	// Otherwise resolve the same way the recorder does: search the manage list
+	// by the FULL filename (UPnShare indexes videos by their original filename)
+	// and match on exact name. This is the path that works in production.
 	if filename != "" {
+		if list, se := searchUPnShareByName(filename, apiKey); se == nil {
+			for i := range list {
+				if list[i].Name == filename {
+					p, pr := buildUPnShareURLs(&list[i])
+					return p, pr, nil
+				}
+			}
+		}
+
+		// Fallback: search by username + timestamp-token match for recordings
+		// whose stored filename differs from the host's name.
 		user := upnshareUsername(filename)
 		token := upnshareTimestampToken(filename)
-		if list, se := searchUPnShareByName(user, apiKey); se == nil {
-			if v := matchUPnShareVideo(list, filename, token, videoID); v != nil {
-				p, pr := buildUPnShareURLs(v)
-				return p, pr, nil
+		if user != "" {
+			if list, se := searchUPnShareByName(user, apiKey); se == nil {
+				if v := matchUPnShareVideo(list, filename, token, videoID); v != nil {
+					p, pr := buildUPnShareURLs(v)
+					return p, pr, nil
+				}
 			}
 		}
 	}
@@ -219,9 +234,15 @@ func searchUPnShareByName(search, apiKey string) ([]upnshareManageVideo, error) 
 // ─── SeekStreaming media (poster + preview) fetch ────────────────────────────
 
 // GetSeekStreamingMediaURLs fetches both the poster and preview URLs for a
-// SeekStreaming video in a single API call.
-func GetSeekStreamingMediaURLs(key, videoID string) (posterURL, previewURL string, err error) {
-	req, err := http.NewRequest("GET", fmt.Sprintf("https://seekstreaming.com/api/v1/video/manage/%s", videoID), nil)
+// SeekStreaming video. It mirrors the recorder: search the manage list by the
+// recording's full filename and match on exact name (the embed URL's #fragment
+// is NOT a reliable manage id, so by-ID lookups 404).
+func GetSeekStreamingMediaURLs(key, videoID, filename string) (posterURL, previewURL string, err error) {
+	if filename == "" {
+		return "", "", fmt.Errorf("empty filename for seekstreaming lookup")
+	}
+	reqURL := fmt.Sprintf("https://seekstreaming.com/api/v1/video/manage?search=%s&perPage=5", url.QueryEscape(filename))
+	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
 		return "", "", fmt.Errorf("create request: %w", err)
 	}
@@ -240,22 +261,31 @@ func GetSeekStreamingMediaURLs(key, videoID string) (posterURL, previewURL strin
 		return "", "", fmt.Errorf("status %d — %s", resp.StatusCode, strings.TrimSpace(string(_body)))
 	}
 
-	var detail struct {
-		Poster   string `json:"poster"`
-		Preview  string `json:"preview"`
-		AssetURL string `json:"assetUrl"`
+	var listResp struct {
+		Data []struct {
+			Name     string `json:"name"`
+			Poster   string `json:"poster"`
+			Preview  string `json:"preview"`
+			AssetURL string `json:"assetUrl"`
+		} `json:"data"`
 	}
-	if err := json.Unmarshal(_body, &detail); err != nil {
+	if err := json.Unmarshal(_body, &listResp); err != nil {
 		return "", "", fmt.Errorf("decode: %w (body: %s)", err, string(_body))
 	}
 
-	if detail.Poster != "" && detail.AssetURL != "" {
-		posterURL = detail.AssetURL + detail.Poster
+	for _, v := range listResp.Data {
+		if v.Name == filename {
+			if v.Poster != "" && v.AssetURL != "" {
+				posterURL = v.AssetURL + v.Poster
+			}
+			if v.Preview != "" && v.AssetURL != "" {
+				previewURL = v.AssetURL + v.Preview
+			}
+			return posterURL, previewURL, nil
+		}
 	}
-	if detail.Preview != "" && detail.AssetURL != "" {
-		previewURL = detail.AssetURL + detail.Preview
-	}
-	return posterURL, previewURL, nil
+
+	return "", "", fmt.Errorf("SeekStreaming media not available yet for %s", filename)
 }
 
 // MediaHostOf resolves which video host a recording's embed URL points at and
