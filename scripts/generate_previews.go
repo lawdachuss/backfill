@@ -330,8 +330,8 @@ func generatePreviewFromVideo(videoPath string) (string, error) {
 	defer os.Remove(prevWebp)
 
 	log.Printf("  uploading preview to image host...")
-	imgUploader := uploader.NewMultiImageUploader()
-	url, _, err := imgUploader.Upload(prevWebp)
+	catbox := uploader.NewCatboxUploader()
+	url, err := catbox.Upload(prevWebp)
 	if err != nil {
 		return "", fmt.Errorf("preview upload failed: %w", err)
 	}
