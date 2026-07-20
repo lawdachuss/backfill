@@ -356,9 +356,6 @@ func main() {
 	server.Config = &entity.Config{
 		SupabaseURL:    supabaseURL,
 		SupabaseAPIKey: supabaseKey,
-		GitHubToken:    os.Getenv("GITHUB_ACCESS_TOKEN"),
-		GitHubRepo:     os.Getenv("GITHUB_REPO"),
-		GitHubBranch:   os.Getenv("GITHUB_BRANCH"),
 	}
 
 	dbClient := server.GetDBClient()
