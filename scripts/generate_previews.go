@@ -5,7 +5,6 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -16,13 +15,6 @@ import (
 
 	"github.com/teacat/chaturbate-dvr/entity"
 	"github.com/teacat/chaturbate-dvr/server"
-)
-
-// ─── flags ───────────────────────────────────────────────────────────────────
-var (
-	flagShard  = flag.Int("shard", 0, "Zero-based shard index (0..shards-1)")
-	flagShards = flag.Int("shards", 1, "Total number of shards")
-	flagLimit  = flag.Int("limit", 0, "Max recordings to process (0 = unlimited)")
 )
 
 func loadDotEnv(path string) {
@@ -136,7 +128,6 @@ func paginatedPreviews() ([]previewRow, error) {
 }
 
 func main() {
-	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lshortfile)
 	log.Println("=== Sync Preview Images to Recordings ===")
 
