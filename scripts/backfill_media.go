@@ -359,9 +359,9 @@ func main() {
 				}
 			}
 
-			didWork := processOne(item, seekKey, upnKeys, *flagDryRun, *flagThumbOnly)
+			processOne(item, seekKey, upnKeys, *flagDryRun, *flagThumbOnly)
 
-			if i < len(todo)-1 && didWork {
+			if i < len(todo)-1 {
 				if *flagDelay != "" {
 					dDur, err := time.ParseDuration(*flagDelay)
 					if err == nil && dDur > 0 {
