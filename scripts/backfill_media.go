@@ -359,9 +359,12 @@ func main() {
 				}
 			}
 
-			processOne(item, seekKey, upnKeys, *flagDryRun, *flagThumbOnly)
+			didWork := processOne(item, seekKey, upnKeys, *flagDryRun, *flagThumbOnly)
 
-			if i < len(todo)-1 {
+			// Only throttle after a real fetch/write. Rows that are "not ready"
+			// on the host do no work and carry no rate-limit risk, so we move
+			// on to the next recording immediately instead of idling 2 minutes.
+			if i < len(todo)-1 && didWork {
 				if *flagDelay != "" {
 					dDur, err := time.ParseDuration(*flagDelay)
 					if err == nil && dDur > 0 {
