@@ -60,42 +60,35 @@ func GetUPnShareMediaURLs(apiKeys []string, videoID, filename string) (posterURL
 	}
 
 	// Resolve via the manage list, trying each key in turn.
+	//
+	// CRITICAL: only an EXACT name match is accepted. The host's `name` field
+	// carries the full timestamp (e.g. "user_2026-07-18_02-16-34_1.video.muxed.mp4"),
+	// so distinct recordings have distinct names. A loose substring/token match
+	// would silently assign one video's poster/preview to a different recording
+	// (we saw _1/_2/base collapse to the same asset). To avoid cross-assignment
+	// mistakes we never fall back to a partial match.
 	for _, apiKey := range apiKeys {
-		if filename != "" {
-			if list, se := searchUPnShareByName(filename, apiKey); se == nil {
-				for i := range list {
-					if list[i].Name == filename {
-						p, pr := buildUPnShareURLs(&list[i])
-						return p, pr, nil
-					}
-				}
-			}
-
-			// Fallback: search by username + timestamp-token match for recordings
-			// whose stored filename differs from the host's name.
-			user := upnshareUsername(filename)
-			token := upnshareTimestampToken(filename)
-			if user != "" {
-				if list, se := searchUPnShareByName(user, apiKey); se == nil {
-					if v := matchUPnShareVideo(list, filename, token, videoID); v != nil {
-						p, pr := buildUPnShareURLs(v)
-						return p, pr, nil
-					}
-				}
-			}
+		if filename == "" {
+			continue
 		}
+		merged := normalizeMergedName(filename)
 
-		// Last resort: by-ID lookup (works only when the player ID equals the
-		// manage id). Tried per-key since the id may be scoped to a key.
-		if videoID != "" {
-			if detail, e := fetchUPnShareByID(apiKey, videoID); e == nil {
-				p, pr := buildUPnShareURLs(detail)
+		// Search by username (the part before the timestamp) to pull the user's
+		// videos, then pick the entry whose name equals our file exactly.
+		user := upnshareUsername(filename)
+		searchTerm := user
+		if searchTerm == "" {
+			searchTerm = filename
+		}
+		if list, se := searchUPnShareByName(searchTerm, apiKey); se == nil {
+			if v := findExactUPnShareMatch(list, filename, merged); v != nil {
+				p, pr := buildUPnShareURLs(v)
 				return p, pr, nil
 			}
 		}
 	}
 
-	return "", "", fmt.Errorf("UPnShare media not available yet for %s", videoID)
+	return "", "", fmt.Errorf("UPnShare media not available yet for %s", filename)
 }
 
 func fetchUPnShareByID(apiKey, videoID string) (*upnshareManageVideo, error) {
@@ -122,6 +115,30 @@ func fetchUPnShareByID(apiKey, videoID string) (*upnshareManageVideo, error) {
 		return nil, fmt.Errorf("empty response")
 	}
 	return &detail, nil
+}
+
+// normalizeMergedName returns the filename with a trailing ".merged" stripped
+// (e.g. "x.video.muxed.mp4.merged.mp4" -> "x.video.muxed.mp4"). The host may
+// store either form, so we match both.
+func normalizeMergedName(filename string) string {
+	if strings.HasSuffix(filename, ".merged.mp4") {
+		return strings.TrimSuffix(filename, ".merged.mp4") + ".mp4"
+	}
+	return filename
+}
+
+// findExactUPnShareMatch returns the list entry whose name equals either
+// candidate (the DB filename or its de-merged variant). Only an exact match is
+// accepted; partial/substring matches are rejected to prevent one video's
+// poster/preview being assigned to a different recording.
+func findExactUPnShareMatch(list []upnshareManageVideo, a, b string) *upnshareManageVideo {
+	for i := range list {
+		v := &list[i]
+		if v.Name == a || v.Name == b {
+			return v
+		}
+	}
+	return nil
 }
 
 // buildUPnShareURLs assembles the absolute poster/preview URLs from a manage
@@ -210,7 +227,7 @@ var (
 )
 
 func searchUPnShareByName(search, apiKey string) ([]upnshareManageVideo, error) {
-	reqURL := fmt.Sprintf("https://upnshare.com/api/v1/video/manage?search=%s&perPage=10", url.QueryEscape(search))
+	reqURL := fmt.Sprintf("https://upnshare.com/api/v1/video/manage?search=%s&perPage=50", url.QueryEscape(search))
 	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -243,7 +260,7 @@ func GetSeekStreamingMediaURLs(key, videoID, filename string) (posterURL, previe
 	if filename == "" {
 		return "", "", fmt.Errorf("empty filename for seekstreaming lookup")
 	}
-	reqURL := fmt.Sprintf("https://seekstreaming.com/api/v1/video/manage?search=%s&perPage=5", url.QueryEscape(filename))
+	reqURL := fmt.Sprintf("https://seekstreaming.com/api/v1/video/manage?search=%s&perPage=50", url.QueryEscape(filename))
 	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
 		return "", "", fmt.Errorf("create request: %w", err)
@@ -275,8 +292,9 @@ func GetSeekStreamingMediaURLs(key, videoID, filename string) (posterURL, previe
 		return "", "", fmt.Errorf("decode: %w (body: %s)", err, string(_body))
 	}
 
+	merged := normalizeMergedName(filename)
 	for _, v := range listResp.Data {
-		if v.Name == filename {
+		if v.Name == filename || v.Name == merged {
 			if v.Poster != "" && v.AssetURL != "" {
 				posterURL = v.AssetURL + v.Poster
 			}

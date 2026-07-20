@@ -346,7 +346,7 @@ func (c *Client) GetAllRecordings() ([]Recording, error) {
 
 	for {
 		var page []Recording
-		path := fmt.Sprintf("/recordings?order=timestamp.desc&limit=%d&offset=%d", pageSize, offset)
+		path := fmt.Sprintf("/recordings?order=timestamp.desc,filename.asc&limit=%d&offset=%d", pageSize, offset)
 		if err := c.get(path, &page); err != nil {
 			return nil, err
 		}

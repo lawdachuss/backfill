@@ -67,6 +67,7 @@ var (
 	flagTrigger     = flag.Bool("trigger-workflow", false, "Trigger a new workflow run on exit if duration exceeded")
 	flagShard       = flag.Int("shard", 0, "Zero-based shard index when splitting work across a matrix (0..shards-1)")
 	flagShards      = flag.Int("shards", 1, "Total number of shards (1 = process everything in one job)")
+	flagNoCache     = flag.Bool("no-cache", false, "Ignore the memorized cache and re-query every recording")
 )
 
 // ─── counters ─────────────────────────────────────────────────────────────────
@@ -78,7 +79,55 @@ var (
 	cntSkipped    int64
 	cntFailed     int64
 	cntNotReady   int64
+	cntCacheHit   int64
 )
+
+// ─── memorized cache ──────────────────────────────────────────────────────────
+//
+// To avoid repeating mistakes and redundant host calls across runs, we persist a
+// mapping of filename -> resolved (thumbnail, preview) URLs (and a set of
+// filenames confirmed "not available" on the hosts). On startup the cache is
+// loaded; resolved entries are reused and "not available" entries are skipped.
+// This also serves as an audit trail of what was assigned to each recording.
+
+const cacheFile = "backfill_cache.json"
+
+type cacheEntry struct {
+	Thumbnail string `json:"thumbnail"`
+	Preview   string `json:"preview"`
+	NotAvail  bool   `json:"not_avail,omitempty"`
+}
+
+var cacheMu sync.Mutex
+var cacheMap map[string]cacheEntry
+
+func loadCache() {
+	cacheMap = map[string]cacheEntry{}
+	f, err := os.Open(cacheFile)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_ = json.NewDecoder(f).Decode(&cacheMap)
+}
+
+// initCache makes sure cacheMap is never nil so writes are safe even with -no-cache.
+func initCache() {
+	if cacheMap == nil {
+		cacheMap = map[string]cacheEntry{}
+	}
+}
+
+func saveCache() {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	f, err := os.Create(cacheFile)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_ = json.NewEncoder(f).Encode(cacheMap)
+}
 
 // ─── .env loader (same pattern as upload_videos.go) ─────────────────────────
 
@@ -155,6 +204,43 @@ func processOne(item workItem, seekKey string, upnKeys []string, dryRun, thumbOn
 		return false
 	}
 
+	// ── Memorized cache ──────────────────────────────────────────────────────
+	// If we previously resolved this file (or confirmed it has no host media),
+	// reuse that knowledge instead of hitting the API again. This prevents
+	// repeating mistakes and avoids redundant host calls.
+	cacheMu.Lock()
+	cached, inCache := cacheMap[rec.Filename]
+	cacheMu.Unlock()
+	if inCache {
+		atomic.AddInt64(&cntCacheHit, 1)
+		if cached.NotAvail {
+			// Already confirmed missing on the hosts; nothing to do.
+			atomic.AddInt64(&cntSkipped, 1)
+			return false
+		}
+		// Reuse the memorized URLs (only the fields this recording still needs).
+		if needThumb && cached.Thumbnail != "" {
+			rec.ThumbnailURL = cached.Thumbnail
+			needThumb = false
+		}
+		if needPreview && cached.Preview != "" {
+			rec.PreviewURL = cached.Preview
+			needPreview = false
+		}
+		if !needThumb && !needPreview {
+			atomic.AddInt64(&cntSkipped, 1)
+			return false
+		}
+		// Partially cached (e.g. only thumb was known) — fall through to fetch
+		// the remaining field, but seed what we already have.
+		if cached.Thumbnail != "" {
+			rec.ThumbnailURL = cached.Thumbnail
+		}
+		if cached.Preview != "" {
+			rec.PreviewURL = cached.Preview
+		}
+	}
+
 	logf("%-60s  [thumb=%v preview=%v]  host=%s",
 		rec.Filename, needThumb, needPreview, item.host)
 
@@ -170,13 +256,14 @@ func processOne(item workItem, seekKey string, upnKeys []string, dryRun, thumbOn
 		hosts = append(hosts, "seekstreaming", "upnshare")
 	}
 
+	gotError := false
 	for _, host := range hosts {
 		t, p, err := fetchHostMedia(seekKey, upnKeys, host, item.videoID, rec.Filename)
 		if err != nil {
 			// Almost always "media not generated yet" (404/400). Treat as
 			// not-ready and try the next host rather than a hard failure.
 			errorf("  %s fetch for %s not ready: %v", host, rec.Filename, err)
-			atomic.AddInt64(&cntNotReady, 1)
+			gotError = true
 			continue
 		}
 
@@ -195,6 +282,18 @@ func processOne(item workItem, seekKey string, upnKeys []string, dryRun, thumbOn
 		if !needThumb && (!thumbOnly || !needPreview) {
 			break
 		}
+	}
+
+	// If we couldn't satisfy a need and at least one host errored, the media
+	// simply isn't ready yet (counted once per recording, not per host attempt).
+	if gotError && (needThumb || needPreview) {
+		atomic.AddInt64(&cntNotReady, 1)
+		// Memorize the "not available" verdict so we stop re-querying videos
+		// that genuinely aren't on the hosts (avoids repeating the mistake).
+		cacheMu.Lock()
+		cacheMap[rec.Filename] = cacheEntry{NotAvail: true}
+		cacheMu.Unlock()
+		return false
 	}
 
 	changed := thumb != rec.ThumbnailURL || preview != rec.PreviewURL
@@ -219,6 +318,11 @@ func processOne(item workItem, seekKey string, upnKeys []string, dryRun, thumbOn
 	}
 	logf("  ✓ DB updated for %s (thumb=%v preview=%v)", rec.Filename,
 		thumb != rec.ThumbnailURL, preview != rec.PreviewURL)
+
+	// Memorize the resolved mapping so future runs reuse it verbatim.
+	cacheMu.Lock()
+	cacheMap[rec.Filename] = cacheEntry{Thumbnail: patchThumb, Preview: patchPreview}
+	cacheMu.Unlock()
 	return true
 }
 
@@ -265,6 +369,12 @@ func triggerWorkflowDispatch(repo, token string) error {
 func main() {
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmsgprefix)
+
+	if !*flagNoCache {
+		loadCache()
+	}
+	initCache()
+	defer saveCache()
 
 	loadDotEnv(".env")
 
@@ -415,7 +525,9 @@ func main() {
 	}
 
 	// ── Trigger Next Run ─────────────────────────────────────────────────────
-	if durationExceeded && *flagTrigger {
+	// Only shard 0 fires the next dispatch; otherwise every matrix shard would
+	// re-trigger independently and stampede the scheduler.
+	if durationExceeded && *flagTrigger && *flagShard == 0 {
 		githubToken := os.Getenv("GITHUB_TOKEN")
 		if githubToken == "" {
 			githubToken = os.Getenv("GH_TOKEN")
@@ -443,5 +555,6 @@ func main() {
 	fmt.Printf("  ⏳ Not ready yet:      %d\n", atomic.LoadInt64(&cntNotReady))
 	fmt.Printf("  ✗ Failed:             %d\n", atomic.LoadInt64(&cntFailed))
 	fmt.Printf("  ⏭ Already complete:   %d\n", atomic.LoadInt64(&cntSkipped))
+	fmt.Printf("  ⚡ Cache hits:         %d\n", atomic.LoadInt64(&cntCacheHit))
 	fmt.Println("═══════════════════════════════════════════════════")
 }
