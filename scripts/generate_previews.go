@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +19,13 @@ import (
 	"github.com/teacat/chaturbate-dvr/channel"
 	"github.com/teacat/chaturbate-dvr/entity"
 	"github.com/teacat/chaturbate-dvr/server"
+)
+
+// ─── flags (added for pagination + sharding) ────────────────────────────────
+var (
+	flagShard  = flag.Int("shard", 0, "Zero-based shard index (0..shards-1)")
+	flagShards = flag.Int("shards", 1, "Total number of shards")
+	flagLimit  = flag.Int("limit", 0, "Max recordings to process (0 = unlimited)")
 )
 
 func loadDotEnv(path string) {
@@ -145,6 +153,56 @@ func supabasePost(path string, body interface{}) error {
 	return nil
 }
 
+// ── paginated helpers (added: fetch ALL recordings/previews, not just 500) ──
+
+// paginatedRecordings fetches ALL recordings by paginating 1000 at a time.
+func paginatedRecordings() ([]recordingRow, error) {
+	var all []recordingRow
+	offset := 0
+	pageSize := 1000
+	for {
+		var page []recordingRow
+		path := fmt.Sprintf("/recordings?order=timestamp.desc,filename.asc&limit=%d&offset=%d", pageSize, offset)
+		data, err := supabaseGet(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(data, &page); err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if len(page) < pageSize {
+			break
+		}
+		offset += pageSize
+	}
+	return all, nil
+}
+
+// paginatedPreviews fetches ALL preview_images by paginating 1000 at a time.
+func paginatedPreviews() ([]previewRow, error) {
+	var all []previewRow
+	offset := 0
+	pageSize := 1000
+	for {
+		var page []previewRow
+		path := fmt.Sprintf("/preview_images?limit=%d&offset=%d", pageSize, offset)
+		data, err := supabaseGet(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(data, &page); err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if len(page) < pageSize {
+			break
+		}
+		offset += pageSize
+	}
+	return all, nil
+}
+
 func downloadWithYtDlp(pageURL, workDir, filename string) (string, error) {
 	if _, lookErr := exec.LookPath("yt-dlp"); lookErr != nil {
 		return "", fmt.Errorf("yt-dlp not found in PATH")
@@ -193,6 +251,7 @@ func checkFFmpeg() {
 }
 
 func main() {
+	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lshortfile)
 	log.Println("=== Generate Missing Previews ===")
 
@@ -221,27 +280,24 @@ func main() {
 		log.Printf("WARN: Supabase health check: %v", err)
 	}
 
-	log.Println("Fetching recordings from Supabase...")
-	recData, err := supabaseGet("/recordings?order=timestamp.desc&limit=500")
+	// ── Fetch ALL recordings (paginated) instead of just 500 ────────────────
+	log.Println("Fetching ALL recordings from Supabase (paginated)...")
+	recordings, err := paginatedRecordings()
 	if err != nil {
 		log.Fatalf("failed to fetch recordings: %v", err)
 	}
-	var recordings []recordingRow
-	if err := json.Unmarshal(recData, &recordings); err != nil {
-		log.Fatalf("failed to parse recordings: %v", err)
-	}
-	log.Printf("Found %d recordings", len(recordings))
+	log.Printf("Found %d recordings total", len(recordings))
 
-	log.Println("Fetching existing preview images...")
-	prevData, err := supabaseGet("/preview_images?limit=500")
+	// ── Fetch ALL existing preview images (paginated) ───────────────────────
+	log.Println("Fetching ALL existing preview images (paginated)...")
+	previews, err := paginatedPreviews()
 	if err != nil {
 		log.Printf("WARN: could not fetch preview images: %v", err)
+		previews = nil
 	}
-	var previews []previewRow
-	if prevData != nil {
-		json.Unmarshal(prevData, &previews)
-	}
+	log.Printf("Found %d existing preview records", len(previews))
 
+	// ── Phase 1: fix recordings table for recordings that already have preview images
 	hasPreview := map[string]bool{}
 	for _, p := range previews {
 		if p.ThumbnailURL != "" || p.SpriteURL != "" {
@@ -249,7 +305,6 @@ func main() {
 		}
 	}
 
-	// Phase 1: fix recordings table for recordings that already have preview images
 	for _, p := range previews {
 		if p.ThumbnailURL == "" && p.SpriteURL == "" {
 			continue
@@ -271,10 +326,44 @@ func main() {
 		}
 	}
 
-	// Phase 2: download + generate for recordings still missing previews
+	// ── Determine which recordings still need work ──────────────────────────
+	var todo []recordingRow
+	for _, r := range recordings {
+		if hasPreview[r.Filename] {
+			continue
+		}
+		todo = append(todo, r)
+	}
+	log.Printf("Recordings still needing preview generation: %d", len(todo))
+
+	// ── Shard the work across matrix jobs ───────────────────────────────────
+	// Each shard handles every Nth recording so load is evenly distributed.
+	if *flagShards > 1 {
+		s := *flagShard
+		if s < 0 {
+			s = 0
+		}
+		if s >= *flagShards {
+			s = *flagShards - 1
+		}
+		var sliced []recordingRow
+		for i := s; i < len(todo); i += *flagShards {
+			sliced = append(sliced, todo[i])
+		}
+		todo = sliced
+		log.Printf("Shard %d/%d — processing %d of %d pending recordings", s, *flagShards, len(todo), len(recordings))
+	}
+
+	// ── Apply optional limit ────────────────────────────────────────────────
+	if *flagLimit > 0 && len(todo) > *flagLimit {
+		log.Printf("Limiting to %d recordings (--limit flag)", *flagLimit)
+		todo = todo[:*flagLimit]
+	}
+
+	// ── Phase 2: download + generate for recordings still missing previews ──
 	workDir := filepath.Join("videos", ".preview_work")
 
-	for _, r := range recordings {
+	for _, r := range todo {
 		if hasPreview[r.Filename] {
 			continue
 		}
