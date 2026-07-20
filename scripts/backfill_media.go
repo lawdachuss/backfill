@@ -65,6 +65,8 @@ var (
 	flagDelay       = flag.String("delay", "", "Delay between consecutive video backfills (e.g. 5m)")
 	flagThumbOnly   = flag.Bool("thumb-only", false, "Only backfill thumbnails (no preview fetch)")
 	flagTrigger     = flag.Bool("trigger-workflow", false, "Trigger a new workflow run on exit if duration exceeded")
+	flagShard       = flag.Int("shard", 0, "Zero-based shard index when splitting work across a matrix (0..shards-1)")
+	flagShards      = flag.Int("shards", 1, "Total number of shards (1 = process everything in one job)")
 )
 
 // ─── counters ─────────────────────────────────────────────────────────────────
@@ -336,6 +338,25 @@ func main() {
 		todo = append(todo, workItem{rec: r, host: host, videoID: videoID})
 	}
 	logf("Missing thumbnail and/or preview (with resolvable host): %d", len(todo))
+	totalPending := len(todo)
+
+	// Split work across a matrix: each shard handles every Nth recording so the
+	// load is evenly distributed and pending rows get retried in parallel.
+	if *flagShards > 1 {
+		shard := *flagShard
+		if shard < 0 {
+			shard = 0
+		}
+		if shard >= *flagShards {
+			shard = *flagShards - 1
+		}
+		var sliced []workItem
+		for i := shard; i < len(todo); i += *flagShards {
+			sliced = append(sliced, todo[i])
+		}
+		todo = sliced
+		logf("Shard %d/%d — processing %d of %d pending recordings", shard, *flagShards, len(todo), totalPending)
+	}
 
 	if *flagLimit > 0 && len(todo) > *flagLimit {
 		logf("Limiting to %d recordings (--limit flag)", *flagLimit)
