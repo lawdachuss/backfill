@@ -254,14 +254,13 @@ func checkFFmpeg() {
 //
 // generateThumbnailFromVideo extracts a single frame via ffmpeg and uploads it
 // to Pixhost.to via the existing ThumbnailUploader.  Returns the public URL.
-// If the video is too short (< 3s) it grabs the first frame instead.
 
 func generateThumbnailFromVideo(videoPath string) (string, error) {
 	workDir := filepath.Dir(videoPath)
 	stem := strings.TrimSuffix(filepath.Base(videoPath), filepath.Ext(videoPath))
 	thumbJpg := filepath.Join(workDir, stem+"_thumb.jpg")
 
-	// Probe duration to pick a sane seek point
+	// Probe duration to pick a sane seek point (~1/3 into the video)
 	durStr := "10"
 	if b, err := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration",
 		"-of", "csv=p=0", videoPath).Output(); err == nil {
@@ -269,8 +268,9 @@ func generateThumbnailFromVideo(videoPath string) (string, error) {
 	}
 
 	var seekSec string
-	if f, e := fmt.Sscanf(durStr, "%f", &f); e == nil && f > 3 {
-		seekSec = fmt.Sprintf("%.0f", f/3) // seek to 1/3 into the video
+	var dur float64
+	if _, err := fmt.Sscanf(durStr, "%f", &dur); err == nil && dur > 3 {
+		seekSec = fmt.Sprintf("%.0f", dur/3)
 	} else {
 		seekSec = "1"
 	}
