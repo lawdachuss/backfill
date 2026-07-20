@@ -46,6 +46,6 @@ jobs:
           go-version: stable
 
       - name: Run backfill shard ${{ matrix.shard }} (5h max, 2min delay on success)
-        run: go run scripts/backfill_media.go -duration 5h -delay 2m -concurrency 1 -shard ${{ matrix.shard }} -shards 8 -trigger-workflow
+        run: go run scripts/backfill_media.go -duration 5h -delay 30s -concurrency 1 -shard ${{ matrix.shard }} -shards 8 -trigger-workflow
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
