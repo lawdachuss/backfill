@@ -1,48 +1,46 @@
 //go:build ignore
 
 // backfill_media.go — backfills missing thumbnail and preview URLs for all
-// recordings in the Supabase database by pulling them from the upload hosts
-// (SeekStreaming and UPnShare).
+// recordings in the Supabase database.
 //
-// Sprites were removed. Thumbnails and previews are now sourced entirely from
-// the upload hosts' poster/preview URLs (generated after upload), so this
-// script no longer downloads any video or runs FFmpeg.
-//
-// Strategy:
-//   For every recording that is missing a thumbnail_url and/or preview_url,
-//   determine which host it lives on from its embed_url (#fragment video ID):
-//     - SeekStreaming  (embed contains "seekstreaming" / "seeks.cloud")
-//     - UPnShare        (embed contains "upns" / "upnshare")
-//   then query that host's manage API for the poster (thumbnail) and preview
-//   URLs and patch them into the recordings row. SeekStreaming is tried first,
-//   then UPnShare as a fallback, when the embed URL doesn't name a host.
+// Phase 1 (host API):  For recordings with embed_url on SeekStreaming or
+//   UPnShare, query the host's manage API for poster (thumbnail) and preview
+//   URLs — no video download required. Also checks ALL upload_links for
+//   SeekStreaming/UPnShare links when embed_url doesn't resolve.
+// Phase 2 (FFmpeg):    For recordings that still need assets and have upload
+//   links on hosts without a poster/preview API (GoFile, Streamtape, etc.),
+//   resolve a direct download URL and use FFmpeg HTTP range requests to
+//   generate the thumbnail and preview without downloading the full video.
 //
 // Usage:
 //   go run scripts/backfill_media.go [flags]
 //
 // Flags:
 //   -dry-run        Print what would be done without writing to DB
-//   -concurrency N  Number of concurrent workers (default 1 — hosts are shared
-//                   and rate-limited, so sequential is safest; raise only if you
-//                   know your host quota)
+//   -concurrency N  Number of concurrent workers (default 1)
 //   -limit N        Stop after processing N recordings (0 = unlimited)
 //   -duration       Max duration to run before exiting (e.g. 5h45m)
 //   -delay          Delay between consecutive backfills (e.g. 5m)
 //   -thumb-only     Only backfill thumbnails (no preview fetch)
 //   -trigger-workflow  Trigger a new workflow run on exit if duration exceeded
+//   -no-ffmpeg      Skip the FFmpeg fallback (host API only)
 
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -58,37 +56,35 @@ import (
 // ─── flags ───────────────────────────────────────────────────────────────────
 
 var (
-	flagDryRun      = flag.Bool("dry-run", false, "Print plan without writing to DB")
-	flagConcurrency = flag.Int("concurrency", 1, "Concurrent workers (hosts are rate-limited; 1 is safest)")
-	flagLimit       = flag.Int("limit", 0, "Max recordings to process (0 = unlimited)")
-	flagDuration    = flag.String("duration", "", "Max duration to run before exiting (e.g. 5h45m)")
-	flagDelay       = flag.String("delay", "", "Delay between consecutive video backfills (e.g. 5m)")
-	flagThumbOnly   = flag.Bool("thumb-only", false, "Only backfill thumbnails (no preview fetch)")
-	flagTrigger     = flag.Bool("trigger-workflow", false, "Trigger a new workflow run on exit if duration exceeded")
-	flagShard       = flag.Int("shard", 0, "Zero-based shard index when splitting work across a matrix (0..shards-1)")
-	flagShards      = flag.Int("shards", 1, "Total number of shards (1 = process everything in one job)")
-	flagNoCache     = flag.Bool("no-cache", false, "Ignore the memorized cache and re-query every recording")
+	flagDryRun       = flag.Bool("dry-run", false, "Print plan without writing to DB")
+	flagConcurrency  = flag.Int("concurrency", 1, "Concurrent workers (hosts are rate-limited; 1 is safest)")
+	flagLimit        = flag.Int("limit", 0, "Max recordings to process (0 = unlimited)")
+	flagDuration     = flag.String("duration", "", "Max duration to run before exiting (e.g. 5h45m)")
+	flagDelay        = flag.String("delay", "", "Delay between consecutive video backfills (e.g. 5m)")
+	flagThumbOnly    = flag.Bool("thumb-only", false, "Only backfill thumbnails (no preview fetch)")
+	flagTrigger      = flag.Bool("trigger-workflow", false, "Trigger a new workflow run on exit if duration exceeded")
+	flagShard        = flag.Int("shard", 0, "Zero-based shard index when splitting work across a matrix (0..shards-1)")
+	flagShards       = flag.Int("shards", 1, "Total number of shards (1 = process everything in one job)")
+	flagNoCache      = flag.Bool("no-cache", false, "Ignore the memorized cache and re-query every recording")
+	flagNoFFmpeg     = flag.Bool("no-ffmpeg", false, "Skip the FFmpeg fallback (host API only)")
 )
 
 // ─── counters ─────────────────────────────────────────────────────────────────
 
 var (
-	cntTotal      int64
-	cntThumb      int64
-	cntPreview    int64
-	cntSkipped    int64
-	cntFailed     int64
-	cntNotReady   int64
-	cntCacheHit   int64
+	cntTotal        int64
+	cntThumb        int64
+	cntPreview      int64
+	cntSkipped      int64
+	cntFailed       int64
+	cntNotReady     int64
+	cntCacheHit     int64
+	cntFFmpegThumb  int64
+	cntFFmpegPrev   int64
+	cntNoSource     int64
 )
 
 // ─── memorized cache ──────────────────────────────────────────────────────────
-//
-// To avoid repeating mistakes and redundant host calls across runs, we persist a
-// mapping of filename -> resolved (thumbnail, preview) URLs (and a set of
-// filenames confirmed "not available" on the hosts). On startup the cache is
-// loaded; resolved entries are reused and "not available" entries are skipped.
-// This also serves as an audit trail of what was assigned to each recording.
 
 const cacheFile = "backfill_cache.json"
 
@@ -111,7 +107,6 @@ func loadCache() {
 	_ = json.NewDecoder(f).Decode(&cacheMap)
 }
 
-// initCache makes sure cacheMap is never nil so writes are safe even with -no-cache.
 func initCache() {
 	if cacheMap == nil {
 		cacheMap = map[string]cacheEntry{}
@@ -129,7 +124,7 @@ func saveCache() {
 	_ = json.NewEncoder(f).Encode(cacheMap)
 }
 
-// ─── .env loader (same pattern as upload_videos.go) ─────────────────────────
+// ─── .env loader ─────────────────────────────────────────────────────────────
 
 func loadDotEnv(path string) {
 	f, err := os.Open(path)
@@ -148,7 +143,7 @@ func loadDotEnv(path string) {
 			continue
 		}
 		k := strings.TrimSpace(parts[0])
-		v := strings.Trim(strings.TrimSpace(parts[1]), `'"`)
+		v := strings.Trim(strings.TrimSpace(parts[1]), `'\"`)
 		if os.Getenv(k) == "" {
 			os.Setenv(k, v)
 		}
@@ -163,10 +158,410 @@ func errorf(format string, a ...interface{}) {
 	log.Printf("[backfill:ERR] "+format, a...)
 }
 
+// ─── Upload links map ─────────────────────────────────────────────────────────
+
+// loadAllUploadLinks fetches ALL upload_links and groups them by recording_id.
+// Used to find SeekStreaming/UPnShare links when embed_url doesn't resolve.
+func loadAllUploadLinks(client *database.Client) map[string][]database.UploadLink {
+	logf("Pre-fetching all upload links for FFmpeg fallback…")
+	links, err := client.GetAllUploadLinks()
+	if err != nil {
+		errorf("GetAllUploadLinks: %v", err)
+		return nil
+	}
+	byRec := make(map[string][]database.UploadLink, len(links))
+	for _, l := range links {
+		byRec[l.RecordingID] = append(byRec[l.RecordingID], l)
+	}
+	logf("Total upload links: %d, linked recordings: %d", len(links), len(byRec))
+	return byRec
+}
+
+// ─── GoFile download URL resolution ──────────────────────────────────────────
+
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+// extractGoFileCode extracts the file/folder code from a GoFile URL.
+// Works with: https://gofile.io/d/{code}, https://gofile.io/w/{code}
+func extractGoFileCode(rawURL string) string {
+	// Try direct link format first: https://gofile.io/d/CODE
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(strings.TrimRight(u.Path, "/"), "/")
+	if len(parts) > 0 {
+		code := parts[len(parts)-1]
+		if len(code) >= 4 && !strings.Contains(code, ".") {
+			return code
+		}
+	}
+	return ""
+}
+
+// getGoFileGuestToken obtains a guest account token from GoFile.
+// Used to access the contents API for resolving file download URLs.
+func getGoFileGuestToken() (string, error) {
+	resp, err := httpClient.Post("https://api.gofile.io/accounts", "application/json",
+		bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		return "", fmt.Errorf("create account: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("create account status %d: %s", resp.StatusCode, string(body))
+	}
+	var result struct {
+		Status string `json:"status"`
+		Data   struct {
+			Token          string `json:"token"`
+			AccountType    string `json:"accountType"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("decode account: %w", err)
+	}
+	if result.Status != "ok" {
+		return "", fmt.Errorf("create account status: %s", result.Status)
+	}
+	return result.Data.Token, nil
+}
+
+// getGoFileDirectURL resolves a GoFile share URL to a direct download link.
+// Uses the GoFile contents API with guest authentication.
+func getGoFileDirectURL(shareURL string) (string, int64, error) {
+	code := extractGoFileCode(shareURL)
+	if code == "" {
+		return "", 0, fmt.Errorf("cannot extract GoFile code from %s", shareURL)
+	}
+
+	token, err := getGoFileGuestToken()
+	if err != nil {
+		return "", 0, fmt.Errorf("guest token: %w", err)
+	}
+
+	req, err := http.NewRequest("GET",
+		fmt.Sprintf("https://api.gofile.io/contents/%s?cache=true", code), nil)
+	if err != nil {
+		return "", 0, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", 0, fmt.Errorf("contents request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return "", 0, fmt.Errorf("contents status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Status string `json:"status"`
+		Data   struct {
+			Children map[string]struct {
+				Link string `json:"link"`
+				Size int64  `json:"size"`
+				Mime string `json:"mimetype"`
+			} `json:"children"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", 0, fmt.Errorf("decode contents: %w", err)
+	}
+	if result.Status != "ok" {
+		return "", 0, fmt.Errorf("contents status: %s", result.Status)
+	}
+
+	for _, child := range result.Data.Children {
+		if child.Link != "" && strings.HasPrefix(child.Mime, "video/") {
+			return child.Link, child.Size, nil
+		}
+	}
+	for _, child := range result.Data.Children {
+		if child.Link != "" {
+			return child.Link, child.Size, nil
+		}
+	}
+
+	return "", 0, fmt.Errorf("no downloadable link found in GoFile contents")
+}
+
+// ─── FFmpeg helpers ──────────────────────────────────────────────────────────
+
+func ffmpegBinPath() string {
+	if p := os.Getenv("FFMPEG_PATH"); p != "" {
+		return p
+	}
+	return "ffmpeg"
+}
+
+// ffmpegRunLocal runs ffmpeg with the given arguments and waits for completion.
+func ffmpegRunLocal(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, ffmpegBinPath(), args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ffmpeg %v: %s (%v)", args, string(output), err)
+	}
+	return nil
+}
+
+// ─── Thumbnail generation from URL (FFmpeg HTTP range) ───────────────────────
+
+// urlGenThumbnail extracts a single frame from a video URL at 15% duration,
+// scales it to 1280x720, and writes a JPEG thumbnail to the given output path.
+func urlGenThumbnail(videoURL string, dur float64, tmpDir, filename string) (string, error) {
+	if dur <= 0 {
+		dur = 30 // default assumption if unknown
+	}
+	seekSec := dur * 0.15
+	thumbFile := filepath.Join(tmpDir, filename+".thumb.jpg")
+
+	args := []string{
+		"-ss", fmt.Sprintf("%.1f", seekSec),
+		"-i", videoURL,
+		"-vframes", "1",
+		"-q:v", "3",
+		"-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease",
+		"-y", thumbFile,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	if err := ffmpegRunLocal(ctx, args...); err != nil {
+		return "", fmt.Errorf("generate thumbnail: %w", err)
+	}
+	return thumbFile, nil
+}
+
+// urlGenPreview generates a short WebP preview from a video URL.
+// Extracts 8 short clips at regular intervals and concatenates them.
+func urlGenPreview(videoURL string, dur float64, tmpDir, filename string) (string, error) {
+	if dur <= 0 {
+		dur = 30
+	}
+	previewFile := filepath.Join(tmpDir, filename+".preview.webp")
+
+	// Sample 8 clips of 1 second each spaced evenly across the video
+	interval := dur / 9 // slightly less than 1/8 to avoid going past the end
+	startSec := dur * 0.05 // start at 5% to skip intro
+	clipDir := filepath.Join(tmpDir, filename+"_clips")
+	if err := os.MkdirAll(clipDir, 0755); err != nil {
+		return "", fmt.Errorf("create clip dir: %w", err)
+	}
+	defer os.RemoveAll(clipDir)
+
+	// First collect clip count — estimate how many full clips we can fit
+	clipCount := 8
+	if dur < 16 {
+		clipCount = int(dur / 2)
+		if clipCount < 2 {
+			clipCount = 2
+		}
+	}
+	interval = (dur * 0.9) / float64(clipCount+1)
+
+	var clipFiles []string
+	for i := 0; i < clipCount; i++ {
+		seek := startSec + interval*float64(i)
+		clipFile := filepath.Join(clipDir, fmt.Sprintf("clip%d.webp", i))
+		args := []string{
+			"-ss", fmt.Sprintf("%.1f", seek),
+			"-i", videoURL,
+			"-t", "1",
+			"-vf", "fps=10,scale='min(320,iw)':'min(180,ih)':force_original_aspect_ratio=decrease",
+			"-loop", "0",
+			"-y", clipFile,
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		err := ffmpegRunLocal(ctx, args...)
+		cancel()
+		if err != nil {
+			continue
+		}
+		if st, err := os.Stat(clipFile); err == nil && st.Size() > 100 {
+			clipFiles = append(clipFiles, clipFile)
+		}
+	}
+
+	if len(clipFiles) == 0 {
+		return "", fmt.Errorf("no preview clips could be generated")
+	}
+
+	// Concatenate clips into single preview
+	var filterParts []string
+	for _, f := range clipFiles {
+		filterParts = append(filterParts, fmt.Sprintf("file '%s'", strings.ReplaceAll(f, "'", "'\\''")))
+	}
+	concatFile := filepath.Join(tmpDir, filename+"_concat.txt")
+	if err := os.WriteFile(concatFile, []byte(strings.Join(filterParts, "\n")), 0644); err != nil {
+		return "", fmt.Errorf("write concat file: %w", err)
+	}
+	defer os.Remove(concatFile)
+
+	concatArgs := []string{
+		"-f", "concat",
+		"-safe", "0",
+		"-i", concatFile,
+		"-c:v", "libwebp",
+		"-lossless", "0",
+		"-q:v", "60",
+		"-y", previewFile,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	if err := ffmpegRunLocal(ctx, concatArgs...); err != nil {
+		return "", fmt.Errorf("concat preview: %w", err)
+	}
+	return previewFile, nil
+}
+
+// generateMediaFromURL generates thumbnail and/or preview from a CDN URL.
+// Returns file paths for the generated assets AND the temp directory path.
+// Caller must clean up the temp directory after uploading the files.
+func generateMediaFromURL(cdnURL, filename string, fileSize int64, needThumb, needPreview bool) (thumbPath, previewPath, tmpDir string, err error) {
+	tmpDir, err = os.MkdirTemp("", "backfill-*")
+	if err != nil {
+		return "", "", "", fmt.Errorf("create temp dir: %w", err)
+	}
+
+	// Probe duration via ffprobe
+	dur := probeDuration(cdnURL)
+	if dur <= 0 && fileSize > 0 {
+		// Estimate: assume ~5 Mbps average bitrate
+		dur = float64(fileSize) * 8 / (5 * 1024 * 1024)
+	}
+	if dur <= 0 {
+		dur = 30 // fallback
+	}
+	logf("  duration=%.1fs size=%d", dur, fileSize)
+
+	var wg sync.WaitGroup
+	var thumbErr, prevErr error
+
+	if needThumb {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tp, err := urlGenThumbnail(cdnURL, dur, tmpDir, filename)
+			if err != nil {
+				thumbErr = fmt.Errorf("thumbnail: %w", err)
+				return
+			}
+			thumbPath = tp
+		}()
+	}
+
+	if needPreview {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pp, err := urlGenPreview(cdnURL, dur, tmpDir, filename)
+			if err != nil {
+				prevErr = fmt.Errorf("preview: %w", err)
+				return
+			}
+			previewPath = pp
+		}()
+	}
+
+	wg.Wait()
+
+	if thumbErr != nil {
+		return thumbPath, previewPath, tmpDir, thumbErr
+	}
+	if prevErr != nil {
+		return thumbPath, previewPath, tmpDir, prevErr
+	}
+	if thumbPath == "" && previewPath == "" {
+		return "", "", tmpDir, fmt.Errorf("no media generated")
+	}
+	return thumbPath, previewPath, tmpDir, nil
+}
+
+// ffprobeBinPath returns the path to ffprobe.
+func ffprobeBinPath() string {
+	if p := os.Getenv("FFPROBE_PATH"); p != "" {
+		return p
+	}
+	// Same directory as ffmpeg
+	if ff := ffmpegBinPath(); ff != "ffmpeg" {
+		if dir := filepath.Dir(ff); dir != "." {
+			probe := filepath.Join(dir, "ffprobe")
+			if _, err := os.Stat(probe); err == nil {
+				return probe
+			}
+			probe += ".exe"
+			if _, err := os.Stat(probe); err == nil {
+				return probe
+			}
+		}
+	}
+	return "ffprobe"
+}
+
+// probeDuration uses ffprobe to get the duration of a remote video URL.
+func probeDuration(videoURL string) float64 {
+	args := []string{
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		videoURL,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffprobeBinPath(), args...)
+	output, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	var dur float64
+	if _, err := fmt.Sscanf(string(output), "%f", &dur); err != nil {
+		return 0
+	}
+	return dur
+}
+
+// ─── Upload helpers ──────────────────────────────────────────────────────────
+
+// uploadGeneratedMedia uploads a generated thumbnail and/or preview file.
+// Thumbnails go to Pixhost (via ThumbnailUploader), previews go to Catbox.
+func uploadGeneratedMedia(thumbPath, previewPath string) (thumbURL, previewURL string, err error) {
+	if thumbPath != "" {
+		thumbUp := uploader.NewThumbnailUploader(os.Getenv("IMGBB_API_KEY"))
+		url, upErr := thumbUp.Upload(thumbPath)
+		if upErr != nil {
+			// Fallback: try Catbox
+			cb := uploader.NewCatboxUploader()
+			url, upErr = cb.Upload(thumbPath)
+			if upErr != nil {
+				return "", "", fmt.Errorf("upload thumbnail: %w", upErr)
+			}
+		}
+		thumbURL = url
+		logf("  ✓ thumbnail uploaded: %s", thumbURL)
+	}
+
+	if previewPath != "" {
+		cb := uploader.NewCatboxUploader()
+		url, upErr := cb.Upload(previewPath)
+		if upErr != nil {
+			return thumbURL, "", fmt.Errorf("upload preview: %w", upErr)
+		}
+		previewURL = url
+		logf("  ✓ preview uploaded: %s", previewURL)
+	}
+
+	return thumbURL, previewURL, nil
+}
+
 // ─── host media fetch ─────────────────────────────────────────────────────────
 
-// fetchHostMedia fetches poster/preview for a single video from the correct
-// host backend. Only the host implied by the recording's embed URL is queried.
 func fetchHostMedia(seekKey string, upnKeys []string, host, videoID, filename string) (thumb, prev string, err error) {
 	switch host {
 	case "seekstreaming":
@@ -184,14 +579,47 @@ func fetchHostMedia(seekKey string, upnKeys []string, host, videoID, filename st
 	}
 }
 
+// ─── Media source resolution from upload links ───────────────────────────────
+
+// resolveMediaSource iterates through a recording's upload links to find a
+// downloadable source URL. Currently supports GoFile. Returns the direct
+// CDN URL and file size.
+func resolveMediaSource(links []database.UploadLink) (string, int64, error) {
+	// Priority: GoFile, then any other URL
+	for _, link := range links {
+		h := strings.ToLower(link.Host)
+		u := strings.ToLower(link.URL)
+
+		if strings.Contains(h, "gofile") || strings.Contains(u, "gofile.io") {
+			directURL, size, err := getGoFileDirectURL(link.URL)
+			if err != nil {
+				logf("  GoFile resolution failed for %s: %v", link.URL, err)
+				continue
+			}
+			return directURL, size, nil
+		}
+	}
+
+	// Fallback: try any link URL directly (works for some hosts)
+	for _, link := range links {
+		if strings.HasPrefix(link.URL, "http") && !strings.Contains(link.URL, "gofile.io") {
+			return link.URL, 0, nil
+		}
+	}
+
+	return "", 0, fmt.Errorf("no resolvable media source found")
+}
+
 // ─── worker ──────────────────────────────────────────────────────────────────
 
 type workItem struct {
-	rec     database.Recording
-	host    string
-	videoID string
+	rec         database.Recording
+	host        string
+	videoID     string
+	uploadLinks []database.UploadLink // for FFmpeg fallback
 }
 
+// processOne handles a single recording. Returns true if any work was done.
 func processOne(item workItem, seekKey string, upnKeys []string, dryRun, thumbOnly bool) bool {
 	rec := item.rec
 	atomic.AddInt64(&cntTotal, 1)
@@ -205,20 +633,15 @@ func processOne(item workItem, seekKey string, upnKeys []string, dryRun, thumbOn
 	}
 
 	// ── Memorized cache ──────────────────────────────────────────────────────
-	// If we previously resolved this file (or confirmed it has no host media),
-	// reuse that knowledge instead of hitting the API again. This prevents
-	// repeating mistakes and avoids redundant host calls.
 	cacheMu.Lock()
 	cached, inCache := cacheMap[rec.Filename]
 	cacheMu.Unlock()
 	if inCache {
 		atomic.AddInt64(&cntCacheHit, 1)
 		if cached.NotAvail {
-			// Already confirmed missing on the hosts; nothing to do.
 			atomic.AddInt64(&cntSkipped, 1)
 			return false
 		}
-		// Reuse the memorized URLs (only the fields this recording still needs).
 		if needThumb && cached.Thumbnail != "" {
 			rec.ThumbnailURL = cached.Thumbnail
 			needThumb = false
@@ -231,8 +654,6 @@ func processOne(item workItem, seekKey string, upnKeys []string, dryRun, thumbOn
 			atomic.AddInt64(&cntSkipped, 1)
 			return false
 		}
-		// Partially cached (e.g. only thumb was known) — fall through to fetch
-		// the remaining field, but seed what we already have.
 		if cached.Thumbnail != "" {
 			rec.ThumbnailURL = cached.Thumbnail
 		}
@@ -247,49 +668,77 @@ func processOne(item workItem, seekKey string, upnKeys []string, dryRun, thumbOn
 	thumb := rec.ThumbnailURL
 	preview := rec.PreviewURL
 
-	// Determine which host(s) to query. If the embed URL names a host, use it;
-	// otherwise try SeekStreaming first, then UPnShare.
-	hosts := []string{}
+	// ── Phase 1: Try host API ────────────────────────────────────────────────
 	if item.host != "" {
-		hosts = append(hosts, item.host)
-	} else {
-		hosts = append(hosts, "seekstreaming", "upnshare")
+		hosts := []string{item.host}
+		if item.host != "seekstreaming" && item.host != "upnshare" {
+			hosts = append(hosts, "seekstreaming", "upnshare")
+		}
+		for _, host := range hosts {
+			t, p, err := fetchHostMedia(seekKey, upnKeys, host, item.videoID, rec.Filename)
+			if err != nil {
+				logf("  %s API: %v", host, err)
+				continue
+			}
+			if needThumb && t != "" {
+				thumb = t
+				needThumb = false
+				atomic.AddInt64(&cntThumb, 1)
+				logf("  ✓ thumb via %s: %s", host, t)
+			}
+			if !thumbOnly && needPreview && p != "" {
+				preview = p
+				needPreview = false
+				atomic.AddInt64(&cntPreview, 1)
+				logf("  ✓ preview via %s: %s", host, p)
+			}
+			if !needThumb && (!thumbOnly || !needPreview) {
+				break
+			}
+		}
 	}
 
-	gotError := false
-	for _, host := range hosts {
-		t, p, err := fetchHostMedia(seekKey, upnKeys, host, item.videoID, rec.Filename)
+	// ── Phase 2: FFmpeg fallback (only when no host API is available) ──────
+	if !*flagNoFFmpeg && item.host == "" && (needThumb || (!thumbOnly && needPreview)) && len(item.uploadLinks) > 0 {
+		logf("  ⚡ trying FFmpeg fallback for %s…", rec.Filename)
+
+		cdnURL, fileSize, err := resolveMediaSource(item.uploadLinks)
 		if err != nil {
-			// Almost always "media not generated yet" (404/400). Treat as
-			// not-ready and try the next host rather than a hard failure.
-			errorf("  %s fetch for %s not ready: %v", host, rec.Filename, err)
-			gotError = true
-			continue
-		}
+			logf("  ⚡ no resolvable media source: %v", err)
+			atomic.AddInt64(&cntNoSource, 1)
+		} else {
+			genThumb := needThumb
+			genPrev := !thumbOnly && needPreview
 
-		if needThumb && t != "" {
-			thumb = t
-			needThumb = false
-			atomic.AddInt64(&cntThumb, 1)
-			logf("  ✓ thumb via %s: %s", host, t)
-		}
-		if !thumbOnly && needPreview && p != "" {
-			preview = p
-			needPreview = false
-			atomic.AddInt64(&cntPreview, 1)
-			logf("  ✓ preview via %s: %s", host, p)
-		}
-		if !needThumb && (!thumbOnly || !needPreview) {
-			break
+			tPath, pPath, tmpDir, genErr := generateMediaFromURL(cdnURL, rec.Filename, fileSize, genThumb, genPrev)
+			if tmpDir != "" {
+				defer os.RemoveAll(tmpDir)
+			}
+			if genErr != nil {
+				logf("  ⚡ FFmpeg generation failed: %v", genErr)
+			} else {
+				upThumb, upPrev, upErr := uploadGeneratedMedia(tPath, pPath)
+				if upErr != nil {
+					logf("  ⚡ upload failed: %v", upErr)
+				} else {
+					if upThumb != "" {
+						thumb = upThumb
+						needThumb = false
+						atomic.AddInt64(&cntFFmpegThumb, 1)
+					}
+					if upPrev != "" {
+						preview = upPrev
+						needPreview = false
+						atomic.AddInt64(&cntFFmpegPrev, 1)
+					}
+				}
+			}
 		}
 	}
 
-	// If we couldn't satisfy a need and at least one host errored, the media
-	// simply isn't ready yet (counted once per recording, not per host attempt).
-	if gotError && (needThumb || needPreview) {
+	// ── Check if anything changed ────────────────────────────────────────────
+	if needThumb || needPreview {
 		atomic.AddInt64(&cntNotReady, 1)
-		// Memorize the "not available" verdict so we stop re-querying videos
-		// that genuinely aren't on the hosts (avoids repeating the mistake).
 		cacheMu.Lock()
 		cacheMap[rec.Filename] = cacheEntry{NotAvail: true}
 		cacheMu.Unlock()
@@ -298,7 +747,6 @@ func processOne(item workItem, seekKey string, upnKeys []string, dryRun, thumbOn
 
 	changed := thumb != rec.ThumbnailURL || preview != rec.PreviewURL
 	if !changed {
-		errorf("  nothing to update for %s", rec.Filename)
 		atomic.AddInt64(&cntFailed, 1)
 		return false
 	}
@@ -309,9 +757,7 @@ func processOne(item workItem, seekKey string, upnKeys []string, dryRun, thumbOn
 		return true
 	}
 
-	patchThumb := thumb
-	patchPreview := preview
-	if err := server.UpdateRecordingMediaURLs(rec.Filename, patchThumb, patchPreview); err != nil {
+	if err := server.UpdateRecordingMediaURLs(rec.Filename, thumb, preview); err != nil {
 		errorf("  DB patch failed for %s: %v", rec.Filename, err)
 		atomic.AddInt64(&cntFailed, 1)
 		return false
@@ -319,14 +765,14 @@ func processOne(item workItem, seekKey string, upnKeys []string, dryRun, thumbOn
 	logf("  ✓ DB updated for %s (thumb=%v preview=%v)", rec.Filename,
 		thumb != rec.ThumbnailURL, preview != rec.PreviewURL)
 
-	// Memorize the resolved mapping so future runs reuse it verbatim.
 	cacheMu.Lock()
-	cacheMap[rec.Filename] = cacheEntry{Thumbnail: patchThumb, Preview: patchPreview}
+	cacheMap[rec.Filename] = cacheEntry{Thumbnail: thumb, Preview: preview}
 	cacheMu.Unlock()
 	return true
 }
 
-// triggerWorkflowDispatch triggers a workflow dispatch on the specified repository.
+// ─── Workflow trigger ────────────────────────────────────────────────────────
+
 func triggerWorkflowDispatch(repo, token string) error {
 	logf("Triggering workflow_dispatch for %s...", repo)
 
@@ -335,14 +781,13 @@ func triggerWorkflowDispatch(repo, token string) error {
 		ref = "main"
 	}
 
-	url := fmt.Sprintf("https://api.github.com/repos/%s/actions/workflows/backfill.yml/dispatches", repo)
-
+	urlStr := fmt.Sprintf("https://api.github.com/repos/%s/actions/workflows/backfill.yml/dispatches", repo)
 	body, err := json.Marshal(map[string]string{"ref": ref})
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	req, err := http.NewRequest("POST", urlStr, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -386,8 +831,7 @@ func main() {
 	seekKey := os.Getenv("SEEKSTREAMING_KEY")
 	ffmpegPath := os.Getenv("FFMPEG_PATH")
 
-	// UPnShare keys: comma-separated list (UPNSHARE_KEYS) supported, plus the
-	// singular UPNSHARE_KEY for backward compatibility.
+
 	var upnKeys []string
 	if v := os.Getenv("UPNSHARE_KEYS"); v != "" {
 		for _, k := range strings.Split(v, ",") {
@@ -405,11 +849,7 @@ func main() {
 	if supabaseURL == "" || supabaseKey == "" {
 		log.Fatal("SUPABASE_URL and SUPABASE_API_KEY (or SUPABASE_SERVICE_ROLE_KEY) must be set")
 	}
-	if seekKey == "" && len(upnKeys) == 0 {
-		log.Fatal("SEEKSTREAMING_KEY and/or UPNSHARE_KEY(S) must be set")
-	}
 
-	// Bootstrap server config (used by server.UpdateRecordingMediaURLs).
 	server.Config = &entity.Config{
 		SupabaseURL:      supabaseURL,
 		SupabaseAPIKey:   supabaseKey,
@@ -431,27 +871,69 @@ func main() {
 	}
 	logf("Total recordings: %d", len(recordings))
 
+	// Pre-fetch all upload links for the FFmpeg fallback
+	var uploadLinksByRecID map[string][]database.UploadLink
+	if !*flagNoFFmpeg {
+		uploadLinksByRecID = loadAllUploadLinks(client)
+	} else {
+		logf("FFmpeg fallback disabled via -no-ffmpeg flag")
+	}
+
 	// Filter to those missing a thumbnail and/or preview.
 	var todo []workItem
 	for _, r := range recordings {
 		if r.ThumbnailURL != "" && r.PreviewURL != "" {
 			continue
 		}
+
 		host, videoID := uploader.MediaHostOf(r.EmbedURL)
-		if host == "" || videoID == "" {
-			// No embed URL → cannot know which host to query. Skip but count.
-			if r.ThumbnailURL == "" || r.PreviewURL == "" {
-				atomic.AddInt64(&cntSkipped, 1)
+
+		// If embed URL doesn't resolve, try upload links for SeekStreaming/UPnShare
+		if (host == "" || videoID == "") && uploadLinksByRecID != nil {
+			if links, ok := uploadLinksByRecID[r.ID]; ok {
+				for _, link := range links {
+					h, vid := uploader.MediaHostOf(link.URL)
+					if h != "" && vid != "" {
+						host, videoID = h, vid
+						break
+					}
+				}
 			}
-			continue
 		}
-		todo = append(todo, workItem{rec: r, host: host, videoID: videoID})
+
+		item := workItem{rec: r, host: host, videoID: videoID}
+
+		// Attach upload links for FFmpeg fallback
+		if host == "" || videoID == "" {
+			if uploadLinksByRecID != nil {
+				if links, ok := uploadLinksByRecID[r.ID]; ok {
+					item.uploadLinks = links
+				}
+			}
+		} else if uploadLinksByRecID != nil {
+			if links, ok := uploadLinksByRecID[r.ID]; ok {
+				item.uploadLinks = links
+			}
+		}
+
+		todo = append(todo, item)
 	}
-	logf("Missing thumbnail and/or preview (with resolvable host): %d", len(todo))
+
+	logf("Recordings needing work (with any data): %d", len(todo))
+
+	// Count how many have upload links vs not
+	ffmpegCount := 0
+	for _, item := range todo {
+		if (item.host == "" || item.videoID == "") && len(item.uploadLinks) > 0 {
+			ffmpegCount++
+		}
+	}
+	logf("  — with resolvable host API: %d", len(todo)-ffmpegCount)
+	logf("  — FFmpeg fallback candidates: %d", ffmpegCount)
+
 	totalPending := len(todo)
 
-	// Split work across a matrix: each shard handles every Nth recording so the
-	// load is evenly distributed and pending rows get retried in parallel.
+	// Split work across matrix shards
 	if *flagShards > 1 {
 		shard := *flagShard
 		if shard < 0 {
@@ -492,9 +974,6 @@ func main() {
 
 			didWork := processOne(item, seekKey, upnKeys, *flagDryRun, *flagThumbOnly)
 
-			// Only throttle after a real fetch/write. Rows that are "not ready"
-			// on the host do no work and carry no rate-limit risk, so we move
-			// on to the next recording immediately instead of idling 2 minutes.
 			if i < len(todo)-1 && didWork {
 				if *flagDelay != "" {
 					dDur, err := time.ParseDuration(*flagDelay)
@@ -524,9 +1003,6 @@ func main() {
 		wg.Wait()
 	}
 
-	// ── Trigger Next Run ─────────────────────────────────────────────────────
-	// Only shard 0 fires the next dispatch; otherwise every matrix shard would
-	// re-trigger independently and stampede the scheduler.
 	if durationExceeded && *flagTrigger && *flagShard == 0 {
 		githubToken := os.Getenv("GITHUB_TOKEN")
 		if githubToken == "" {
@@ -542,7 +1018,6 @@ func main() {
 		}
 	}
 
-	// ── Report ─────────────────────────────────────────────────────────────────
 	elapsed := time.Since(start).Round(time.Second)
 	fmt.Println()
 	fmt.Println("═══════════════════════════════════════════════════")
@@ -550,11 +1025,14 @@ func main() {
 	fmt.Println("═══════════════════════════════════════════════════")
 	fmt.Printf("  Elapsed:              %v\n", elapsed)
 	fmt.Printf("  Total processed:      %d\n", atomic.LoadInt64(&cntTotal))
-	fmt.Printf("  ✓ Thumbnails fixed:   %d\n", atomic.LoadInt64(&cntThumb))
-	fmt.Printf("  ✓ Previews fixed:     %d\n", atomic.LoadInt64(&cntPreview))
+	fmt.Printf("  ✓ Thumbnails (API):   %d\n", atomic.LoadInt64(&cntThumb))
+	fmt.Printf("  ✓ Previews (API):     %d\n", atomic.LoadInt64(&cntPreview))
+	fmt.Printf("  ✓ Thumbnails (FFmpeg):%d\n", atomic.LoadInt64(&cntFFmpegThumb))
+	fmt.Printf("  ✓ Previews (FFmpeg):  %d\n", atomic.LoadInt64(&cntFFmpegPrev))
 	fmt.Printf("  ⏳ Not ready yet:      %d\n", atomic.LoadInt64(&cntNotReady))
 	fmt.Printf("  ✗ Failed:             %d\n", atomic.LoadInt64(&cntFailed))
 	fmt.Printf("  ⏭ Already complete:   %d\n", atomic.LoadInt64(&cntSkipped))
 	fmt.Printf("  ⚡ Cache hits:         %d\n", atomic.LoadInt64(&cntCacheHit))
+	fmt.Printf("  ❌ No media source:    %d\n", atomic.LoadInt64(&cntNoSource))
 	fmt.Println("═══════════════════════════════════════════════════")
 }
