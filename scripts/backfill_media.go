@@ -541,6 +541,26 @@ func getStreamtapeDirectURL(shareURL, login, key string) (string, int64, error) 
 			return "", 0, fmt.Errorf("empty URL in dl response")
 		}
 
+		// Verify the resolved URL is accessible before returning it.
+		// Streamtape direct URLs are often short-lived or IP-locked.
+		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		verifyReq, verifyErr := http.NewRequestWithContext(verifyCtx, "HEAD", dlResp.Result.URL, nil)
+		if verifyErr == nil {
+			verifyReq.Header.Set("User-Agent", "Mozilla/5.0")
+			verifyResp, verifyErr := httpClient.Do(verifyReq)
+			verifyCancel()
+			if verifyErr == nil {
+				verifyResp.Body.Close()
+				if verifyResp.StatusCode != 200 {
+					logf("  ⚠ Streamtape URL returned HTTP %d, retrying...", verifyResp.StatusCode)
+					lastErr = fmt.Errorf("Streamtape URL verification failed: HTTP %d", verifyResp.StatusCode)
+					continue
+				}
+			}
+		} else {
+			verifyCancel()
+		}
+
 		// Success — reset the circuit breaker
 		streamtapeBreakerRecordSuccess()
 
@@ -551,6 +571,10 @@ func getStreamtapeDirectURL(shareURL, login, key string) (string, int64, error) 
 	streamtapeBreakerRecordFailure()
 	return "", 0, fmt.Errorf("Streamtape resolution failed after %d attempts: %v", streamtapeRetryMaxAttempts, lastErr)
 }
+
+// defaultFFmpegUserAgent is the User-Agent sent by FFmpeg when downloading
+// video URLs. Streamtape and other CDNs may block FFmpeg's default UA.
+const defaultFFmpegUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 
 // ─── FFmpeg helpers ──────────────────────────────────────────────────────────
 
@@ -583,6 +607,7 @@ func urlGenThumbnail(videoURL string, dur float64, tmpDir, filename string) (str
 	thumbFile := filepath.Join(tmpDir, filename+".thumb.jpg")
 
 	args := []string{
+		"-user_agent", defaultFFmpegUserAgent,
 		"-ss", fmt.Sprintf("%.1f", seekSec),
 		"-i", videoURL,
 		"-vframes", "1",
@@ -631,6 +656,7 @@ func urlGenPreview(videoURL string, dur float64, tmpDir, filename string) (strin
 		seek := startSec + interval*float64(i)
 		clipFile := filepath.Join(clipDir, fmt.Sprintf("clip%d.webp", i))
 		args := []string{
+			"-user_agent", defaultFFmpegUserAgent,
 			"-ss", fmt.Sprintf("%.1f", seek),
 			"-i", videoURL,
 			"-t", "1",
@@ -772,6 +798,7 @@ func probeDuration(videoURL string) float64 {
 		"-v", "error",
 		"-show_entries", "format=duration",
 		"-of", "default=noprint_wrappers=1:nokey=1",
+		"-user_agent", defaultFFmpegUserAgent,
 		videoURL,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
