@@ -219,45 +219,6 @@ func gofileBreakerRecordSuccess() {
 	}
 }
 
-// ─── Streamtape circuit breaker ──────────────────────────────────────────────
-
-// streamtapeBreakerMax failures before the circuit trips and skips further
-// Streamtape resolution. This prevents wasting time on every file when
-// Streamtape is consistently rate-limiting or unreachable.
-const streamtapeBreakerMax = 3
-
-var streamtapeBreaker struct {
-	mu       sync.Mutex
-	failures int
-	tripped  bool
-}
-
-func streamtapeBreakerIsTripped() bool {
-	streamtapeBreaker.mu.Lock()
-	defer streamtapeBreaker.mu.Unlock()
-	return streamtapeBreaker.tripped
-}
-
-func streamtapeBreakerRecordFailure() {
-	streamtapeBreaker.mu.Lock()
-	defer streamtapeBreaker.mu.Unlock()
-	streamtapeBreaker.failures++
-	if streamtapeBreaker.failures >= streamtapeBreakerMax && !streamtapeBreaker.tripped {
-		streamtapeBreaker.tripped = true
-		logf("  ⚡ Streamtape circuit breaker tripped after %d consecutive failures — skipping remaining Streamtape resolutions", streamtapeBreaker.failures)
-	}
-}
-
-func streamtapeBreakerRecordSuccess() {
-	streamtapeBreaker.mu.Lock()
-	defer streamtapeBreaker.mu.Unlock()
-	streamtapeBreaker.failures = 0
-	if streamtapeBreaker.tripped {
-		streamtapeBreaker.tripped = false
-		logf("  ✓ Streamtape circuit breaker reset — Streamtape seems to be back online")
-	}
-}
-
 // extractGoFileCode extracts the file/folder code from a GoFile URL.
 // Works with: https://gofile.io/d/{code}, https://gofile.io/w/{code}
 func extractGoFileCode(rawURL string) string {
@@ -381,195 +342,6 @@ func getGoFileDirectURL(shareURL string) (string, int64, error) {
 
 	gofileBreakerRecordFailure()
 	return "", 0, fmt.Errorf("no downloadable link found in GoFile contents")
-}
-
-// ─── Streamtape download URL resolution ────────────────────────────────────
-
-// extractStreamtapeID extracts the file ID from a Streamtape embed URL.
-// Works with: https://streamtape.com/e/{id}/, https://streamtape.com/v/{id}/...
-// The file ID is the path segment that immediately follows "/e/" or "/v/".
-func extractStreamtapeID(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return ""
-	}
-	parts := strings.Split(strings.TrimRight(u.Path, "/"), "/")
-	for i, p := range parts {
-		if (p == "e" || p == "v") && i+1 < len(parts) {
-			candidate := parts[i+1]
-			if !strings.ContainsAny(candidate, ".") {
-				return candidate
-			}
-		}
-	}
-	return ""
-}
-
-// streamtapeRetryMaxAttempts is the maximum number of attempts for Streamtape
-// resolution when rate-limited with a 403.
-const streamtapeRetryMaxAttempts = 5
-
-// streamtapeWaitDuration extracts the required wait duration from a Streamtape
-// 403 error message like "You need to wait 56 more seconds".
-// Returns 0 if the message doesn't match the expected format.
-func streamtapeWaitDuration(errMsg string) time.Duration {
-	var secs int
-	if n, _ := fmt.Sscanf(errMsg, "You need to wait %d more seconds", &secs); n == 1 && secs > 0 {
-		return time.Duration(secs) * time.Second
-	}
-	return 0
-}
-
-// getStreamtapeDirectURL resolves a Streamtape embed URL to a direct download
-// link using the Streamtape API's dlticket + dl endpoints.
-// Retries with backoff on 403 rate-limit errors.
-// Requires valid API login and key credentials.
-func getStreamtapeDirectURL(shareURL, login, key string) (string, int64, error) {
-	if streamtapeBreakerIsTripped() {
-		return "", 0, fmt.Errorf("Streamtape circuit breaker tripped — skipping")
-	}
-
-	fileID := extractStreamtapeID(shareURL)
-	if fileID == "" {
-		return "", 0, fmt.Errorf("cannot extract Streamtape file ID from %s", shareURL)
-	}
-
-	var lastErr error
-	for attempt := 0; attempt < streamtapeRetryMaxAttempts; attempt++ {
-		if attempt > 0 {
-			// Use the wait duration from the Streamtape 403 message if available,
-			// otherwise fall back to exponential backoff.
-			wait := streamtapeWaitDuration(lastErr.Error())
-			if wait == 0 {
-				wait = time.Duration(5<<uint(attempt-1)) * time.Second // 5s, 10s, 20s, 40s
-			} else {
-				wait += 1 * time.Second // small buffer
-			}
-			logf("  ⏳ Streamtape rate-limited, waiting %v before retry (attempt %d/%d)...", wait, attempt+1, streamtapeRetryMaxAttempts)
-			time.Sleep(wait)
-		}
-
-		// Step 1: Get download ticket
-		dlTicketURL := fmt.Sprintf("https://api.streamtape.com/file/dlticket?file=%s&login=%s&key=%s",
-			fileID, url.QueryEscape(login), url.QueryEscape(key))
-
-		req, err := http.NewRequest("GET", dlTicketURL, nil)
-		if err != nil {
-			return "", 0, fmt.Errorf("create dlticket request: %w", err)
-		}
-		req.Header.Set("User-Agent", "Mozilla/5.0")
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			return "", 0, fmt.Errorf("dlticket request: %w", err)
-		}
-
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			return "", 0, fmt.Errorf("dlticket status %d: %s", resp.StatusCode, string(body))
-		}
-
-		var ticketResp struct {
-			Status int    `json:"status"`
-			Msg    string `json:"msg"`
-			Result struct {
-				Ticket   string `json:"ticket"`
-				WaitTime int    `json:"wait_time"`
-			} `json:"result"`
-		}
-		if err := json.Unmarshal(body, &ticketResp); err != nil {
-			return "", 0, fmt.Errorf("decode dlticket response: %w", err)
-		}
-		if ticketResp.Status != 200 {
-			if ticketResp.Status == 403 {
-				lastErr = fmt.Errorf("dlticket API error %d: %s", ticketResp.Status, ticketResp.Msg)
-				continue
-			}
-			return "", 0, fmt.Errorf("dlticket API error %d: %s", ticketResp.Status, ticketResp.Msg)
-		}
-		if ticketResp.Result.Ticket == "" {
-			return "", 0, fmt.Errorf("empty ticket in dlticket response")
-		}
-
-		// Respect the mandatory cooldown before calling dl
-		if ticketResp.Result.WaitTime > 0 {
-			logf("  ⏳ Streamtape requires %ds wait before download...", ticketResp.Result.WaitTime)
-			time.Sleep(time.Duration(ticketResp.Result.WaitTime) * time.Second)
-		}
-
-		// Step 2: Get direct download URL using the ticket
-		dlURL := fmt.Sprintf("https://api.streamtape.com/file/dl?file=%s&ticket=%s",
-			fileID, url.QueryEscape(ticketResp.Result.Ticket))
-
-		req2, err := http.NewRequest("GET", dlURL, nil)
-		if err != nil {
-			return "", 0, fmt.Errorf("create dl request: %w", err)
-		}
-		req2.Header.Set("User-Agent", "Mozilla/5.0")
-
-		resp2, err := httpClient.Do(req2)
-		if err != nil {
-			return "", 0, fmt.Errorf("dl request: %w", err)
-		}
-		body2, _ := io.ReadAll(resp2.Body)
-		resp2.Body.Close()
-
-		if resp2.StatusCode != 200 {
-			return "", 0, fmt.Errorf("dl status %d: %s", resp2.StatusCode, string(body2))
-		}
-
-		var dlResp struct {
-			Status int    `json:"status"`
-			Msg    string `json:"msg"`
-			Result struct {
-				URL string `json:"url"`
-			} `json:"result"`
-		}
-		if err := json.Unmarshal(body2, &dlResp); err != nil {
-			return "", 0, fmt.Errorf("decode dl response: %w", err)
-		}
-		if dlResp.Status != 200 {
-			if dlResp.Status == 403 {
-				lastErr = fmt.Errorf("dl API error %d: %s", dlResp.Status, dlResp.Msg)
-				continue
-			}
-			return "", 0, fmt.Errorf("dl API error %d: %s", dlResp.Status, dlResp.Msg)
-		}
-		if dlResp.Result.URL == "" {
-			return "", 0, fmt.Errorf("empty URL in dl response")
-		}
-
-		// Verify the resolved URL is accessible before returning it.
-		// Streamtape direct URLs are often short-lived or IP-locked.
-		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		verifyReq, verifyErr := http.NewRequestWithContext(verifyCtx, "HEAD", dlResp.Result.URL, nil)
-		if verifyErr == nil {
-			verifyReq.Header.Set("User-Agent", "Mozilla/5.0")
-			verifyResp, verifyErr := httpClient.Do(verifyReq)
-			verifyCancel()
-			if verifyErr == nil {
-				verifyResp.Body.Close()
-				if verifyResp.StatusCode != 200 {
-					logf("  ⚠ Streamtape URL returned HTTP %d, retrying...", verifyResp.StatusCode)
-					lastErr = fmt.Errorf("Streamtape URL verification failed: HTTP %d", verifyResp.StatusCode)
-					continue
-				}
-			}
-		} else {
-			verifyCancel()
-		}
-
-		// Success — reset the circuit breaker
-		streamtapeBreakerRecordSuccess()
-
-		return dlResp.Result.URL, 0, nil
-	}
-
-	// All retries exhausted — record failure for circuit breaker
-	streamtapeBreakerRecordFailure()
-	return "", 0, fmt.Errorf("Streamtape resolution failed after %d attempts: %v", streamtapeRetryMaxAttempts, lastErr)
 }
 
 // defaultFFmpegUserAgent is the User-Agent sent by FFmpeg when downloading
@@ -872,10 +644,12 @@ func fetchHostMedia(seekKey string, upnKeys []string, host, videoID, filename st
 // resolveMediaSource iterates through a recording's upload links to find a
 // downloadable source URL. Tries hosts in priority order:
 //   1. GoFile (with circuit breaker — auto-skips after N consecutive failures)
-//   2. Streamtape (if credentials are provided)
-//   3. Any non-GoFile/non-Streamtape URL directly (works for PixelDrain, Catbox)
-// Returns the direct CDN URL and file size.
-func resolveMediaSource(links []database.UploadLink, streamtapeLogin, streamtapeKey string) (string, int64, error) {
+//   2. Any non-GoFile/non-Streamtape URL directly (works for PixelDrain, Catbox,
+//      LobFile, etc.)
+// Streamtape URLs are intentionally skipped because Streamtape direct download
+// URLs don't support the HTTP range/seek requests that FFmpeg needs for preview
+// generation.
+func resolveMediaSource(links []database.UploadLink) (string, int64, error) {
 	// Priority 1: GoFile (unless circuit breaker is tripped)
 	if !gofileBreakerIsTripped() {
 		for _, link := range links {
@@ -893,26 +667,10 @@ func resolveMediaSource(links []database.UploadLink, streamtapeLogin, streamtape
 		}
 	}
 
-	// Priority 2: Streamtape (if credentials available and circuit not tripped)
-	if streamtapeBreakerIsTripped() {
-		logf("  Streamtape circuit breaker is tripped — skipping Streamtape resolution")
-	} else if streamtapeLogin != "" && streamtapeKey != "" {
-		for _, link := range links {
-			h := strings.ToLower(link.Host)
-			u := strings.ToLower(link.URL)
-
-			if strings.Contains(h, "streamtape") || strings.Contains(u, "streamtape.com") {
-				directURL, size, err := getStreamtapeDirectURL(link.URL, streamtapeLogin, streamtapeKey)
-				if err != nil {
-					logf("  Streamtape resolution failed for %s: %v", link.URL, err)
-					continue
-				}
-				return directURL, size, nil
-			}
-		}
-	}
-
-	// Priority 3: try any link URL directly (works for PixelDrain, Catbox, LobFile, etc.)
+	// Priority 2: try any non-GoFile/non-Streamtape URL directly
+	// (works for PixelDrain, Catbox, LobFile, etc.)
+	// Streamtape URLs are skipped because their direct download URLs don't
+	// support the HTTP range/seek requests FFmpeg needs for preview generation.
 	for _, link := range links {
 		if strings.HasPrefix(link.URL, "http") &&
 			!strings.Contains(link.URL, "gofile.io") &&
@@ -934,7 +692,7 @@ type workItem struct {
 }
 
 // processOne handles a single recording. Returns true if any work was done.
-func processOne(item workItem, seekKey string, upnKeys []string, streamtapeLogin, streamtapeKey string, dryRun, thumbOnly bool) bool {
+func processOne(item workItem, seekKey string, upnKeys []string, dryRun, thumbOnly bool) bool {
 	rec := item.rec
 	atomic.AddInt64(&cntTotal, 1)
 
@@ -1016,7 +774,7 @@ func processOne(item workItem, seekKey string, upnKeys []string, streamtapeLogin
 	if !*flagNoFFmpeg && item.host == "" && (needThumb || (!thumbOnly && needPreview)) && len(item.uploadLinks) > 0 {
 		logf("  ⚡ trying FFmpeg fallback for %s…", rec.Filename)
 
-		cdnURL, fileSize, err := resolveMediaSource(item.uploadLinks, streamtapeLogin, streamtapeKey)
+		cdnURL, fileSize, err := resolveMediaSource(item.uploadLinks)
 		if err != nil {
 			logf("  ⚡ no resolvable media source: %v", err)
 			atomic.AddInt64(&cntNoSource, 1)
@@ -1143,16 +901,7 @@ func main() {
 		supabaseKey = os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
 	}
 	seekKey := os.Getenv("SEEKSTREAMING_KEY")
-	streamtapeLogin := os.Getenv("STREAMTAPE_LOGIN")
-	streamtapeKey := os.Getenv("STREAMTAPE_API_KEY")
-	if streamtapeKey == "" {
-		streamtapeKey = os.Getenv("STREAMTAPE_KEY")
-	}
-	if streamtapeLogin == "" || streamtapeKey == "" {
-		logf("Streamtape credentials not configured — skipping Streamtape resolution")
-	} else {
-		logf("Streamtape resolution enabled")
-	}
+
 	ffmpegPath := os.Getenv("FFMPEG_PATH")
 
 
@@ -1296,7 +1045,7 @@ func main() {
 				}
 			}
 
-			didWork := processOne(item, seekKey, upnKeys, streamtapeLogin, streamtapeKey, *flagDryRun, *flagThumbOnly)
+			didWork := processOne(item, seekKey, upnKeys, *flagDryRun, *flagThumbOnly)
 
 			if i < len(todo)-1 && didWork {
 				if *flagDelay != "" {
@@ -1316,7 +1065,7 @@ func main() {
 			go func() {
 				defer wg.Done()
 				for item := range work {
-					processOne(item, seekKey, upnKeys, streamtapeLogin, streamtapeKey, *flagDryRun, *flagThumbOnly)
+					processOne(item, seekKey, upnKeys, *flagDryRun, *flagThumbOnly)
 				}
 			}()
 		}
