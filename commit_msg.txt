@@ -1,8 +1,0 @@
-fix: resolve 6 bugs found from deep log analysis of last 10 runs
-
-1. Catbox: empty response + timeout now retryable (was failing immediately)
-2. Streamtape: DL URL rate-limit now uses exponential backoff (4s min + 2^N)
-3. runAVTool: added exponential backoff between proxy rotations
-4. genWithFallback: added backoff between egress candidates
-5. backfill.yml: cancel-in-progress: true -> false (stop wasting runs)
-6. keepalive.py: connection reset retried with backoff (was giving up)

@@ -34,6 +34,8 @@ jobs:
       USER_AGENT: ${{ secrets.USER_AGENT }}
       SEEKSTREAMING_KEY: ${{ secrets.SEEKSTREAMING_KEY }}
       UPNSHARE_KEYS: ${{ secrets.UPNSHARE_KEYS }}
+      STREAMTAPE_LOGIN: ${{ secrets.STREAMTAPE_LOGIN }}
+      STREAMTAPE_API_KEY: ${{ secrets.STREAMTAPE_API_KEY }}
       GITHUB_REPO: lawdachuss/backfill
       GITHUB_BRANCH: master
       GITHUB_PREVIEW_PATH: previews
