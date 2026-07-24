@@ -82,6 +82,7 @@ var (
 	cntFFmpegThumb  int64
 	cntFFmpegPrev   int64
 	cntNoSource     int64
+	cntCurlFallback int64
 )
 
 // ─── memorized cache ──────────────────────────────────────────────────────────
@@ -738,6 +739,96 @@ func generateMediaFromURL(cdnURL, filename string, fileSize int64, needThumb, ne
 	return thumbPath, previewPath, tmpDir, nil
 }
 
+// generateMediaFromURLCurl downloads the full video via curl (with Referer + UA
+// headers) and then processes it locally with FFmpeg. This is a fallback for URLs
+// where FFmpeg's HTTP range requests don't work (e.g., Streamtape CDNs that block
+// seeking). The downloaded file supports native fast seeking in FFmpeg.
+func generateMediaFromURLCurl(cdnURL, filename string, needThumb, needPreview bool) (thumbPath, previewPath, tmpDir string, err error) {
+	tmpDir, err = os.MkdirTemp("", "backfill-curl-*")
+	if err != nil {
+		return "", "", "", fmt.Errorf("create temp dir: %w", err)
+	}
+
+	// Download full video to a temp file
+	tmpVideo := filepath.Join(tmpDir, "input.mp4")
+	logf("  ⏳ downloading full video with curl...")
+
+	curlArgs := []string{
+		"-sL",
+		"-H", "Referer: https://streamtape.com/",
+		"-A", defaultFFmpegUserAgent,
+		"-o", tmpVideo,
+		cdnURL,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	curlCmd := exec.CommandContext(ctx, "curl", curlArgs...)
+	output, err := curlCmd.CombinedOutput()
+	if err != nil {
+		return "", "", tmpDir, fmt.Errorf("curl download: %s (%v)", string(output), err)
+	}
+
+	fi, err := os.Stat(tmpVideo)
+	if err != nil || fi.Size() == 0 {
+		return "", "", tmpDir, fmt.Errorf("downloaded file empty or missing")
+	}
+
+	logf("  downloaded %d bytes, processing locally...", fi.Size())
+
+	// Probe duration locally (fast with local file — no range requests needed)
+	dur := probeDuration(tmpVideo)
+	if dur <= 0 && fi.Size() > 0 {
+		dur = float64(fi.Size()) * 8 / (5 * 1024 * 1024)
+	}
+	if dur <= 0 {
+		dur = 30
+	}
+	logf("  duration=%.1fs", dur)
+
+	var wg sync.WaitGroup
+	var thumbErr, prevErr error
+
+	if needThumb {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tp, err := urlGenThumbnail(tmpVideo, dur, tmpDir, filename)
+			if err != nil {
+				thumbErr = fmt.Errorf("thumbnail: %w", err)
+				return
+			}
+			thumbPath = tp
+		}()
+	}
+
+	if needPreview {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pp, err := urlGenPreview(tmpVideo, dur, tmpDir, filename)
+			if err != nil {
+				prevErr = fmt.Errorf("preview: %w", err)
+				return
+			}
+			previewPath = pp
+		}()
+	}
+
+	wg.Wait()
+
+	if thumbErr != nil {
+		return thumbPath, previewPath, tmpDir, thumbErr
+	}
+	if prevErr != nil {
+		return thumbPath, previewPath, tmpDir, prevErr
+	}
+	if thumbPath == "" && previewPath == "" {
+		return "", "", tmpDir, fmt.Errorf("no media generated from local file")
+	}
+	return thumbPath, previewPath, tmpDir, nil
+}
+
 // ffprobeBinPath returns the path to ffprobe.
 func ffprobeBinPath() string {
 	if p := os.Getenv("FFPROBE_PATH"); p != "" {
@@ -992,6 +1083,14 @@ func processOne(item workItem, seekKey string, upnKeys []string, streamtapeLogin
 			tPath, pPath, tmpDir, genErr := generateMediaFromURL(cdnURL, rec.Filename, fileSize, genThumb, genPrev)
 			if tmpDir != "" {
 				defer os.RemoveAll(tmpDir)
+			}
+			if genErr != nil {
+				logf("  ⚡ header approach failed (%v), trying curl download fallback...", genErr)
+				atomic.AddInt64(&cntCurlFallback, 1)
+				tPath, pPath, tmpDir, genErr = generateMediaFromURLCurl(cdnURL, rec.Filename, genThumb, genPrev)
+				if tmpDir != "" {
+					defer os.RemoveAll(tmpDir)
+				}
 			}
 			if genErr != nil {
 				logf("  ⚡ FFmpeg generation failed: %v", genErr)
@@ -1323,5 +1422,6 @@ func main() {
 	fmt.Printf("  ⏭ Already complete:   %d\n", atomic.LoadInt64(&cntSkipped))
 	fmt.Printf("  ⚡ Cache hits:         %d\n", atomic.LoadInt64(&cntCacheHit))
 	fmt.Printf("  ❌ No media source:    %d\n", atomic.LoadInt64(&cntNoSource))
+	fmt.Printf("  ⬇ Curl fallback:      %d\n", atomic.LoadInt64(&cntCurlFallback))
 	fmt.Println("═══════════════════════════════════════════════════")
 }
